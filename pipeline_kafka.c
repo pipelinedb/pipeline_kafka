@@ -24,6 +24,7 @@
 #include "executor/spi.h"
 #include "commands/copy.h"
 #include "commands/dbcommands.h"
+#include "commands/trigger.h"
 #include "lib/stringinfo.h"
 #include "librdkafka/rdkafka.h"
 #include "miscadmin.h"
@@ -39,6 +40,7 @@
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/json.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
@@ -93,6 +95,8 @@ PG_MODULE_MAGIC;
 static volatile sig_atomic_t got_sigterm = false;
 
 void _PG_init(void);
+
+static rd_kafka_t *MyKafka = NULL;
 
 /*
  * Shared-memory state for each consumer process
@@ -224,10 +228,10 @@ open_pipeline_kafka_offsets(void)
 }
 
 /*
- * librdkafka logger function
+ * librdkafka consumer logger function
  */
 static void
-logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf)
+consumer_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf)
 {
 	elog(LOG, "[kafka consumer]: %s", buf);
 }
@@ -433,7 +437,6 @@ copy_next(void *args, void *buf, int minread, int maxread)
 
 	return read;
 }
-
 
 /*
  * save_consumer_state
@@ -649,7 +652,7 @@ kafka_consume_main(Datum arg)
 
 	topic_conf = rd_kafka_topic_conf_new();
 	kafka = rd_kafka_new(RD_KAFKA_CONSUMER, NULL, err_msg, sizeof(err_msg));
-	rd_kafka_set_logger(kafka, logger);
+	rd_kafka_set_logger(kafka, consumer_logger);
 
 	/*
 	 * Add all brokers currently in pipeline_kafka_brokers
@@ -674,7 +677,6 @@ kafka_consume_main(Datum arg)
 
 	Assert(meta->topic_cnt == 1);
 	topic_meta = meta->topics[0];
-
 	load_consumer_offsets(&consumer, &topic_meta, proc->offset);
 	CommitTransactionCommand();
 
@@ -708,7 +710,7 @@ kafka_consume_main(Datum arg)
 		goto done;
 	}
 
-	messages = palloc0(sizeof(rd_kafka_message_t) * consumer.batch_size);
+	messages = palloc0(sizeof(rd_kafka_message_t *) * consumer.batch_size);
 
 	/*
 	 * Consume messages until we are terminated
@@ -924,16 +926,15 @@ launch_consumer_group(Relation consumers, KafkaConsumer *consumer, int64 offset)
 		while ((proc = (KafkaConsumerProc *) hash_seq_search(&iter)) != NULL)
 		{
 			if (proc->consumer_id == consumer->id)
-			{
 				running = true;
-				break;
-			}
 		}
-		hash_seq_term(&iter);
 
 		/* if there are already procs running, it's a noop */
 		if (running)
+		{
+			elog(WARNING, "%s is already being consumed into relation %s", consumer->topic, consumer->rel->relname);
 			return true;
+		}
 
 		/* no procs actually running, so it's ok to launch new ones */
 	}
@@ -1265,3 +1266,134 @@ kafka_remove_broker(PG_FUNCTION_ARGS)
 	RETURN_SUCCESS();
 }
 
+/*
+ * librdkafka producer logger function
+ */
+static void
+producer_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf)
+{
+	elog(LOG, "[kafka producer]: %s", buf);
+}
+
+PG_FUNCTION_INFO_V1(kafka_produce_msg);
+Datum
+kafka_produce_msg(PG_FUNCTION_ARGS)
+{
+	char err_msg[512];
+	rd_kafka_topic_conf_t *topic_conf;
+	rd_kafka_topic_t *topic;
+	char *topic_name;
+	bytea *msg;
+	int partition;
+	char *key;
+	int keylen;
+
+	if (MyKafka == NULL)
+	{
+		ListCell *lc;
+		int valid_brokers = 0;
+		rd_kafka_t *kafka;
+		List *brokers = get_all_brokers();
+
+		if (list_length(brokers) == 0)
+			elog(ERROR, "no valid brokers were found");
+
+		kafka = rd_kafka_new(RD_KAFKA_PRODUCER, NULL, err_msg, sizeof(err_msg));
+		rd_kafka_set_logger(kafka, producer_logger);
+
+		foreach(lc, brokers)
+			valid_brokers += rd_kafka_brokers_add(kafka, lfirst(lc));
+
+		if (valid_brokers == 0)
+		{
+			rd_kafka_destroy(kafka);
+			rd_kafka_wait_destroyed(CONSUMER_TIMEOUT);
+			elog(ERROR, "no valid brokers were found");
+		}
+
+		MyKafka = kafka;
+	}
+
+	if (PG_ARGISNULL(0))
+		elog(ERROR, "topic cannot be null");
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "message cannot be null");
+
+	topic_name = text_to_cstring(PG_GETARG_TEXT_P(0));
+	msg = PG_GETARG_BYTEA_P(1);
+
+	if (PG_ARGISNULL(2))
+		partition = RD_KAFKA_PARTITION_UA;
+	else
+		partition = PG_GETARG_INT64(3);
+
+	if (PG_ARGISNULL(3))
+	{
+		key = NULL;
+		keylen = 0;
+	}
+	else
+	{
+		key = VARDATA_ANY(PG_GETARG_BYTEA_P(4));
+		keylen = VARSIZE_ANY_EXHDR(PG_GETARG_BYTEA_P(4));
+	}
+
+	topic_conf = rd_kafka_topic_conf_new();
+	topic = rd_kafka_topic_new(MyKafka, topic_name, topic_conf);
+
+	if (rd_kafka_produce(topic, partition, RD_KAFKA_MSG_F_COPY, VARDATA_ANY(msg), VARSIZE_ANY_EXHDR(msg),
+			key, keylen, NULL) == -1)
+		elog(ERROR, "failed to produce message: %s", rd_kafka_err2str(rd_kafka_errno2err(errno)));
+
+	rd_kafka_poll(MyKafka, 0);
+
+	RETURN_SUCCESS();
+}
+
+PG_FUNCTION_INFO_V1(kafka_emit_tuple);
+Datum
+kafka_emit_tuple(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	Trigger *trig = trigdata->tg_trigger;
+	HeapTuple tup;
+	TupleDesc desc;
+	Datum json;
+	char *topic;
+
+	if (trig->tgnargs < 1)
+		elog(ERROR, "kafka_emit_tuple: must be provided a topic name");
+
+	/* make sure it's called as a trigger */
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("kafka_emit_tuple: must be called as trigger")));
+
+	/* and that it's called on update or insert */
+	if (!TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event) && !TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("kafka_emit_tuple: must be called on insert or update")));
+
+	/* and that it's called for each row */
+	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("kafka_emit_tuple: must be called for each row")));
+
+	/* and that it's called after insert or update */
+	if (!TRIGGER_FIRED_AFTER(trigdata->tg_event))
+		ereport(ERROR,
+				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+				 errmsg("kafka_emit_tuple: must be called after update")));
+
+	tup = trigdata->tg_trigtuple;
+	desc = RelationGetDescr(trigdata->tg_relation);
+	topic = trig->tgargs[0];
+
+	json = DirectFunctionCall1(row_to_json, heap_copy_tuple_as_datum(tup, desc));
+	DirectFunctionCall2(kafka_produce_msg, CStringGetTextDatum(topic), json);
+
+	return PointerGetDatum(tup);
+}

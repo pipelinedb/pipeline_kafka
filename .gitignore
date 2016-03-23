@@ -32,3 +32,8 @@
 *.dSYM/
 
 config.log
+
+# Eclipse
+.cproject
+.project
+.settings/

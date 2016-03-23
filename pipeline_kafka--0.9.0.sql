@@ -58,6 +58,21 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_consume_end_all'
 LANGUAGE C IMMUTABLE;
 
+CREATE FUNCTION kafka_produce_message (
+  topic     text,
+  message   bytea,
+  partition integer DEFAULT NULL,
+  key       bytea   DEFAULT NULL
+)
+RETURNS text
+AS 'MODULE_PATHNAME', 'kafka_produce_msg'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION kafka_emit_tuple ()
+RETURNS trigger
+AS 'MODULE_PATHNAME', 'kafka_emit_tuple'
+LANGUAGE C IMMUTABLE;
+
 CREATE FUNCTION kafka_add_broker (
   host text
 )
