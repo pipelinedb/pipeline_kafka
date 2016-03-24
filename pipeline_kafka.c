@@ -1410,7 +1410,6 @@ kafka_emit_tuple(PG_FUNCTION_ARGS)
 		{
 			Datum key_name = PointerGetDatum(cstring_to_text(trig->tgargs[2]));
 			Datum key_array = PointerGetDatum(construct_array(&key_name, 1, TEXTOID, -1, false, 'i'));
-			bool err = false;
 			Datum key;
 
 			PG_TRY();
@@ -1419,12 +1418,9 @@ kafka_emit_tuple(PG_FUNCTION_ARGS)
 			}
 			PG_CATCH();
 			{
-				err = true;
+				elog(ERROR, "kafka_emit_tuple: tuple has no column \"%s\"", trig->tgargs[2]);
 			}
 			PG_END_TRY();
-
-			if (err)
-				elog(ERROR, "kafka_emit_tuple: tuple has no column \"%s\"", trig->tgargs[2]);
 
 			DirectFunctionCall4(kafka_produce_msg, CStringGetTextDatum(topic), json, Int32GetDatum(partition), key);
 		}
