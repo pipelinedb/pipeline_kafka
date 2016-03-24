@@ -68,7 +68,7 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_produce_msg'
 LANGUAGE C IMMUTABLE;
 
-CREATE FUNCTION kafka_emit_tuple ()
+CREATE FUNCTION kafka_emit_tuple()
 RETURNS trigger
 AS 'MODULE_PATHNAME', 'kafka_emit_tuple'
 LANGUAGE C IMMUTABLE;

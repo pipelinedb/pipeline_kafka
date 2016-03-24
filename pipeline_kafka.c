@@ -24,6 +24,7 @@
 #include "executor/spi.h"
 #include "commands/copy.h"
 #include "commands/dbcommands.h"
+#include "catalog/pg_type.h"
 #include "commands/trigger.h"
 #include "lib/stringinfo.h"
 #include "librdkafka/rdkafka.h"
@@ -1284,7 +1285,7 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 	rd_kafka_topic_t *topic;
 	char *topic_name;
 	bytea *msg;
-	int partition;
+	int32 partition;
 	char *key;
 	int keylen;
 
@@ -1325,7 +1326,7 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(2))
 		partition = RD_KAFKA_PARTITION_UA;
 	else
-		partition = PG_GETARG_INT64(3);
+		partition = PG_GETARG_INT32(2);
 
 	if (PG_ARGISNULL(3))
 	{
@@ -1334,8 +1335,8 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		key = VARDATA_ANY(PG_GETARG_BYTEA_P(4));
-		keylen = VARSIZE_ANY_EXHDR(PG_GETARG_BYTEA_P(4));
+		key = VARDATA_ANY(PG_GETARG_BYTEA_P(3));
+		keylen = VARSIZE_ANY_EXHDR(PG_GETARG_BYTEA_P(3));
 	}
 
 	topic_conf = rd_kafka_topic_conf_new();
@@ -1363,6 +1364,9 @@ kafka_emit_tuple(PG_FUNCTION_ARGS)
 
 	if (trig->tgnargs < 1)
 		elog(ERROR, "kafka_emit_tuple: must be provided a topic name");
+
+	if (trig->tgnargs > 3)
+		elog(ERROR, "kafka_emit_tuple: only accepts a maximum of 3 arguments");
 
 	/* make sure it's called as a trigger */
 	if (!CALLED_AS_TRIGGER(fcinfo))
@@ -1393,7 +1397,38 @@ kafka_emit_tuple(PG_FUNCTION_ARGS)
 	topic = trig->tgargs[0];
 
 	json = DirectFunctionCall1(row_to_json, heap_copy_tuple_as_datum(tup, desc));
-	DirectFunctionCall2(kafka_produce_msg, CStringGetTextDatum(topic), json);
+
+	if (trig->tgnargs == 1)
+		DirectFunctionCall2(kafka_produce_msg, CStringGetTextDatum(topic), json);
+	else
+	{
+		int32 partition = atoi(trig->tgargs[1]);
+
+		if (trig->tgnargs == 2)
+			DirectFunctionCall3(kafka_produce_msg, CStringGetTextDatum(topic), json, Int64GetDatum(partition));
+		else
+		{
+			Datum key_name = PointerGetDatum(cstring_to_text(trig->tgargs[2]));
+			Datum key_array = PointerGetDatum(construct_array(&key_name, 1, TEXTOID, -1, false, 'i'));
+			bool err = false;
+			Datum key;
+
+			PG_TRY();
+			{
+				key = DirectFunctionCall2(json_extract_path_text, json, key_array);
+			}
+			PG_CATCH();
+			{
+				err = true;
+			}
+			PG_END_TRY();
+
+			if (err)
+				elog(ERROR, "kafka_emit_tuple: tuple has no column \"%s\"", trig->tgargs[2]);
+
+			DirectFunctionCall4(kafka_produce_msg, CStringGetTextDatum(topic), json, Int32GetDatum(partition), key);
+		}
+	}
 
 	return PointerGetDatum(tup);
 }
