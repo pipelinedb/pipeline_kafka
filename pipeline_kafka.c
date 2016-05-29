@@ -92,8 +92,12 @@ PG_MODULE_MAGIC;
 #define OPTION_DELIMITER "delimiter"
 #define OPTION_FORMAT "format"
 #define FORMAT_CSV "csv"
+#define FORMAT_JSON "json"
 #define OPTION_QUOTE "quote"
 #define OPTION_ESCAPE "escape"
+
+#define FORMAT_JSON_QUOTE "\x01"
+#define FORMAT_JSON_DELIMITER "\x02"
 
 #define RD_KAFKA_OFFSET_NULL INT64_MIN
 
@@ -1193,6 +1197,19 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 		quote = NULL;
 	else
 		quote = PG_GETARG_TEXT_P(4);
+
+	if (pg_strcasecmp(TextDatumGetCString(format), FORMAT_JSON) == 0)
+	{
+		pfree(format);
+		format = (text *) CStringGetTextDatum(FORMAT_CSV);
+		if (delimiter != NULL)
+			elog(WARNING, "delimiter cannot be specified with format \"json\", ignoring");
+		delimiter = (text *)  CStringGetTextDatum(FORMAT_JSON_DELIMITER);
+		if (quote != NULL)
+			elog(WARNING, "quote cannot be specified with format \"json\", ignoring");
+		quote = (text *) CStringGetTextDatum(FORMAT_JSON_QUOTE);
+
+	}
 
 	if (PG_ARGISNULL(5))
 		escape = NULL;
