@@ -110,10 +110,10 @@ void _PG_init(void);
 
 typedef struct error_buf_t
 {
-	Size    size;
-	uint32  offset;
-	char   *bytes;
-	slock_t mutex;
+	Size             size;
+	pg_atomic_uint32 offset;
+	char            *bytes;
+	slock_t          mutex;
 } error_buf_t;
 
 #define ERROR_BUF_SIZE 4096
@@ -127,6 +127,7 @@ error_buf_init(error_buf_t *ebuf, Size size)
 	ebuf->size = size;
 	ebuf->bytes = palloc0(size);
 
+	pg_atomic_init_u32(&ebuf->offset, 0);
 	SpinLockInit(&ebuf->mutex);
 }
 
@@ -135,15 +136,19 @@ error_buf_push(error_buf_t *ebuf, const char *str)
 {
 	bool success = false;
 	int len = strlen(str) + 1; /* for \n */
+	uint32 offset;
 
 	SpinLockAcquire(&ebuf->mutex);
 
-	if (ebuf->size - ebuf->offset > len)
+	offset = pg_atomic_read_u32(&ebuf->offset);
+
+	if (ebuf->size - offset > len)
 	{
-		char *pos = &ebuf->bytes[ebuf->offset];
+		char *pos = &ebuf->bytes[offset];
 		memcpy(pos, str, len);
-		ebuf->offset += len;
-		Assert(ebuf->offset <= ebuf->size);
+		offset += len;
+		Assert(offset <= ebuf->size);
+		pg_atomic_write_u32(&ebuf->offset, offset);
 		success = true;
 	}
 
@@ -155,17 +160,18 @@ error_buf_push(error_buf_t *ebuf, const char *str)
 static char *
 error_buf_pop(error_buf_t *ebuf)
 {
-	char *err = NULL;
+	char *err;
+	uint32 offset = pg_atomic_read_u32(&ebuf->offset);
+
+	if (!offset)
+		return NULL;
 
 	SpinLockAcquire(&ebuf->mutex);
 
-	if (ebuf->offset)
-	{
-		err = palloc(ebuf->offset);
-		memcpy(err, ebuf->bytes, ebuf->offset);
-		MemSet(ebuf->bytes, 0, ebuf->size);
-		ebuf->offset = 0;
-	}
+	offset = pg_atomic_read_u32(&ebuf->offset);
+	err = palloc(offset);
+	memcpy(err, ebuf->bytes, offset);
+	pg_atomic_write_u32(&ebuf->offset, 0);
 
 	SpinLockRelease(&ebuf->mutex);
 
