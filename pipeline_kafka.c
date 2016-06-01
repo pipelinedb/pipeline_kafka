@@ -1605,6 +1605,8 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 		if (list_length(brokers) == 0)
 			elog(ERROR, "no valid brokers were found");
 
+		error_buf_init(&my_error_buf, ERROR_BUF_SIZE);
+
 		kafka = rd_kafka_new(RD_KAFKA_PRODUCER, NULL, err_msg, sizeof(err_msg));
 		rd_kafka_set_logger(kafka, producer_logger);
 
@@ -1619,7 +1621,6 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 		}
 
 		MyKafka = kafka;
-		error_buf_init(&my_error_buf, ERROR_BUF_SIZE);
 	}
 
 	if (PG_ARGISNULL(0))
