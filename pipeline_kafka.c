@@ -35,6 +35,7 @@
 #include "nodes/print.h"
 #include "pipeline_kafka.h"
 #include "pipeline/stream.h"
+#include "port/atomics.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -103,10 +104,73 @@ PG_MODULE_MAGIC;
 
 static volatile sig_atomic_t got_sigterm = false;
 static rd_kafka_t *MyKafka = NULL;
-static slock_t elog_mutex;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 void _PG_init(void);
+
+typedef struct error_buf_t
+{
+	Size    size;
+	uint32  offset;
+	char   *bytes;
+	slock_t mutex;
+} error_buf_t;
+
+#define ERROR_BUF_SIZE 4096
+static error_buf_t my_error_buf;
+
+static void
+error_buf_init(error_buf_t *ebuf, Size size)
+{
+	MemSet(ebuf, 0, sizeof(error_buf_t));
+
+	ebuf->size = size;
+	ebuf->bytes = palloc0(size);
+
+	SpinLockInit(&ebuf->mutex);
+}
+
+static bool
+error_buf_push(error_buf_t *ebuf, const char *str)
+{
+	bool success = false;
+	int len = strlen(str) + 1; /* for \n */
+
+	SpinLockAcquire(&ebuf->mutex);
+
+	if (ebuf->size - ebuf->offset > len)
+	{
+		char *pos = &ebuf->bytes[ebuf->offset];
+		memcpy(pos, str, len);
+		ebuf->offset += len;
+		Assert(ebuf->offset <= ebuf->size);
+		success = true;
+	}
+
+	SpinLockRelease(&ebuf->mutex);
+
+	return success;
+}
+
+static char *
+error_buf_pop(error_buf_t *ebuf)
+{
+	char *err = NULL;
+
+	SpinLockAcquire(&ebuf->mutex);
+
+	if (ebuf->offset)
+	{
+		err = palloc(ebuf->offset);
+		memcpy(err, ebuf->bytes, ebuf->offset);
+		MemSet(ebuf->bytes, 0, ebuf->size);
+		ebuf->offset = 0;
+	}
+
+	SpinLockRelease(&ebuf->mutex);
+
+	return err;
+}
 
 /*
  * Shared-memory state for each consumer process
@@ -318,9 +382,7 @@ relinfo_delete(ResultRelInfo *rinfo, ItemPointer tid)
 static void
 consumer_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf)
 {
-	SpinLockAcquire(&elog_mutex);
-	elog(LOG, "[kafka consumer]: %s", buf);
-	SpinLockRelease(&elog_mutex);
+	error_buf_push(&my_error_buf, buf);
 }
 
 /*
@@ -526,7 +588,7 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 	/* timeout */
 	d = slot_getattr(slot, CONSUMER_ATTR_TIMEOUT, &isnull);
 	Assert(!isnull);
-	consumer->batch_size = DatumGetInt32(d);
+	consumer->timeout = DatumGetInt32(d);
 
 	ExecDropSingleTupleTableSlot(slot);
 	index_endscan(scan);
@@ -774,7 +836,8 @@ kafka_consume_main(Datum arg)
 	/* give this proc access to the database */
 	BackgroundWorkerInitializeConnectionByOid(proc->db, InvalidOid);
 
-	SpinLockInit(&elog_mutex);
+	/* set up error buffer */
+	error_buf_init(&my_error_buf, ERROR_BUF_SIZE);
 
 	/* load saved consumer state */
 	StartTransactionCommand();
@@ -852,10 +915,11 @@ kafka_consume_main(Datum arg)
 	 */
 	while (!got_sigterm)
 	{
-		ssize_t num_consumed;
+		int num_consumed;
 		int i;
 		int messages_buffered = 0;
 		int partition;
+		char *librdkerrs;
 		StringInfo buf;
 
 		MemoryContextSwitchTo(work_ctx);
@@ -904,9 +968,13 @@ kafka_consume_main(Datum arg)
 			}
 		}
 
+		librdkerrs = error_buf_pop(&my_error_buf);
+		if (librdkerrs)
+			elog(LOG, "[pipeline_kafka consumer]: %s", librdkerrs);
+
 		if (messages_buffered == 0)
 		{
-			pg_usleep(1000);
+			pg_usleep(10 * 1000);
 			continue;
 		}
 
@@ -1502,9 +1570,7 @@ kafka_remove_broker(PG_FUNCTION_ARGS)
 static void
 producer_logger(const rd_kafka_t *rk, int level, const char *fac, const char *buf)
 {
-	SpinLockAcquire(&elog_mutex);
-	elog(LOG, "[kafka producer]: %s", buf);
-	SpinLockRelease(&elog_mutex);
+	error_buf_push(&my_error_buf, buf);
 }
 
 PG_FUNCTION_INFO_V1(kafka_produce_msg);
@@ -1519,6 +1585,7 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 	int32 partition;
 	char *key;
 	int keylen;
+	char *librdkerrs;
 
 	check_pipeline_kafka_preloaded();
 
@@ -1545,8 +1612,8 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 			elog(ERROR, "no valid brokers were found");
 		}
 
-		SpinLockInit(&elog_mutex);
 		MyKafka = kafka;
+		error_buf_init(&my_error_buf, ERROR_BUF_SIZE);
 	}
 
 	if (PG_ARGISNULL(0))
@@ -1581,6 +1648,10 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 		elog(ERROR, "failed to produce message: %s", rd_kafka_err2str(rd_kafka_errno2err(errno)));
 
 	rd_kafka_poll(MyKafka, 0);
+
+	librdkerrs = error_buf_pop(&my_error_buf);
+	if (librdkerrs)
+		elog(LOG, "[pipeline_kafka producer]: %s", librdkerrs);
 
 	RETURN_SUCCESS();
 }
