@@ -12,6 +12,7 @@ CREATE TABLE pipeline_kafka.consumers (
   escape      text,
   batchsize   integer NOT NULL,
   parallelism integer NOT NULL,
+  timeout     integer NOT NULL,
   UNIQUE (relation, topic)
 );
 
@@ -38,6 +39,7 @@ CREATE FUNCTION pipeline_kafka.consume_begin (
   escape       text    DEFAULT NULL,
   batchsize    integer DEFAULT 1000,
   parallelism  integer DEFAULT 1,
+  timeout      integer DEFAULT 250,
   start_offset bigint  DEFAULT NULL
 )
 RETURNS text
