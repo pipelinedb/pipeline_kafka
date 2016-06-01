@@ -980,7 +980,7 @@ kafka_consume_main(Datum arg)
 
 		if (messages_buffered == 0)
 		{
-			pg_usleep(10 * 1000);
+			pg_usleep(1000);
 			continue;
 		}
 
