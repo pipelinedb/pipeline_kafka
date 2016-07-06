@@ -860,6 +860,8 @@ kafka_consume_main(Datum arg)
 	int i;
 	int my_partitions = 0;
 	MemoryContext work_ctx;
+	char errstr[512];
+	char val[64];
 
 	if (!found)
 	{
@@ -888,6 +890,9 @@ kafka_consume_main(Datum arg)
 	copy = get_copy_statement(&consumer);
 
 	topic_conf = rd_kafka_topic_conf_new();
+	sprintf(val, "%d", consumer.max_bytes);
+	rd_kafka_topic_conf_set(topic_conf, "fetch.message.max.bytes", val, errstr, sizeof(errstr));
+
 	kafka = rd_kafka_new(RD_KAFKA_CONSUMER, NULL, err_msg, sizeof(err_msg));
 	rd_kafka_set_logger(kafka, consumer_logger);
 
