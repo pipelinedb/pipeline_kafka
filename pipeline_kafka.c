@@ -106,6 +106,8 @@ PG_MODULE_MAGIC;
 #define CONSUMER_LOG_PREFIX_PARAMS(consumer) (consumer)->rel->relname, (consumer)->topic, MyProcPid
 #define CONSUMER_WORKER_RESTART_TIME 1
 
+#define MAX_BUF_SIZE (8 * 1024 * 1024) /* 8mb */
+
 static volatile sig_atomic_t got_SIGTERM = false;
 static rd_kafka_t *MyKafka = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -794,6 +796,8 @@ get_copy_statement(KafkaConsumer *consumer)
 static void
 execute_copy(KafkaConsumer *consumer, KafkaConsumerProc *proc, CopyStmt *stmt, StringInfo buf, int num_messages)
 {
+	MemoryContext old = CurrentMemoryContext;
+
 	StartTransactionCommand();
 
 	/* we don't want to die in the event of any errors */
@@ -821,6 +825,8 @@ execute_copy(KafkaConsumer *consumer, KafkaConsumerProc *proc, CopyStmt *stmt, S
 	save_consumer_offsets(consumer, proc->partition_group);
 
 	CommitTransactionCommand();
+
+	MemoryContextSwitchTo(old);
 }
 
 /*
@@ -1009,8 +1015,8 @@ kafka_consume_main(Datum arg)
 				messages[i] = NULL;
 			}
 
-			/* Flush if we've buffered enough messages or space used by messages has exceeded 8mb */
-			if (messages_buffered >= consumer.batch_size || buf->len > 8388608)
+			/* Flush if we've buffered enough messages or space used by messages has exceeded buffer size threshold */
+			if (messages_buffered >= consumer.batch_size || buf->len > MAX_BUF_SIZE)
 			{
 				execute_copy(&consumer, proc, copy, buf, messages_buffered);
 				resetStringInfo(buf);
