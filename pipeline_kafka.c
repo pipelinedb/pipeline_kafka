@@ -1009,7 +1009,8 @@ kafka_consume_main(Datum arg)
 				messages[i] = NULL;
 			}
 
-			if (messages_buffered >= consumer.batch_size || buf->len > 65535)
+			/* Flush if we've buffered enough messages or space used by messages has exceeded 8mb */
+			if (messages_buffered >= consumer.batch_size || buf->len > 8388608)
 			{
 				execute_copy(&consumer, proc, copy, buf, messages_buffered);
 				resetStringInfo(buf);
