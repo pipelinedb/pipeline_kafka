@@ -60,7 +60,7 @@ PG_MODULE_MAGIC;
 #define PIPELINE_KAFKA_SCHEMA "pipeline_kafka"
 
 #define CONSUMER_RELATION "consumers"
-#define CONSUMER_RELATION_NATTS		10
+#define CONSUMER_RELATION_NATTS		11
 #define CONSUMER_ATTR_ID	 		1
 #define CONSUMER_ATTR_RELATION 		2
 #define CONSUMER_ATTR_TOPIC			3
@@ -69,8 +69,9 @@ PG_MODULE_MAGIC;
 #define CONSUMER_ATTR_QUOTE			6
 #define CONSUMER_ATTR_ESCAPE		7
 #define CONSUMER_ATTR_BATCH_SIZE 	8
-#define CONSUMER_ATTR_PARALLELISM 	9
-#define CONSUMER_ATTR_TIMEOUT	 	10
+#define CONSUMER_ATTR_MAX_BYTES 	9
+#define CONSUMER_ATTR_PARALLELISM 	10
+#define CONSUMER_ATTR_TIMEOUT	 	11
 
 #define OFFSETS_RELATION "offsets"
 #define OFFSETS_RELATION_NATTS	3
@@ -105,8 +106,6 @@ PG_MODULE_MAGIC;
 #define CONSUMER_LOG_PREFIX "[pipeline_kafka] %s <- %s (PID %d): "
 #define CONSUMER_LOG_PREFIX_PARAMS(consumer) (consumer)->rel->relname, (consumer)->topic, MyProcPid
 #define CONSUMER_WORKER_RESTART_TIME 1
-
-#define MAX_BUF_SIZE (8 * 1024 * 1024) /* 8mb */
 
 static volatile sig_atomic_t got_SIGTERM = false;
 static rd_kafka_t *MyKafka = NULL;
@@ -224,6 +223,7 @@ typedef struct KafkaConsumer
 	int32_t partition;
 	int64_t offset;
 	int batch_size;
+	int max_bytes;
 	int parallelism;
 	int timeout;
 	char *format;
@@ -596,6 +596,11 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 	d = slot_getattr(slot, CONSUMER_ATTR_BATCH_SIZE, &isnull);
 	Assert(!isnull);
 	consumer->batch_size = DatumGetInt32(d);
+
+	/* max bytes */
+	d = slot_getattr(slot, CONSUMER_ATTR_MAX_BYTES, &isnull);
+	Assert(!isnull);
+	consumer->max_bytes = DatumGetInt32(d);
 
 	/* timeout */
 	d = slot_getattr(slot, CONSUMER_ATTR_TIMEOUT, &isnull);
@@ -1016,7 +1021,7 @@ kafka_consume_main(Datum arg)
 			}
 
 			/* Flush if we've buffered enough messages or space used by messages has exceeded buffer size threshold */
-			if (messages_buffered >= consumer.batch_size || buf->len > MAX_BUF_SIZE)
+			if (messages_buffered >= consumer.batch_size || buf->len >= consumer.max_bytes)
 			{
 				execute_copy(&consumer, proc, copy, buf, messages_buffered);
 				resetStringInfo(buf);
@@ -1057,7 +1062,8 @@ done:
  */
 static int32
 create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
-		text *format, text *delimiter, text *quote, text *escape, int batchsize, int parallelism, int timeout)
+		text *format, text *delimiter, text *quote, text *escape, int batchsize, int maxbytes,
+		int parallelism, int timeout)
 {
 	HeapTuple tup;
 	Datum values[CONSUMER_RELATION_NATTS];
@@ -1078,6 +1084,7 @@ create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 	tup = index_getnext(scan, ForwardScanDirection);
 
 	values[CONSUMER_ATTR_BATCH_SIZE - 1] = Int32GetDatum(batchsize);
+	values[CONSUMER_ATTR_MAX_BYTES - 1] = Int32GetDatum(maxbytes);
 	values[CONSUMER_ATTR_PARALLELISM - 1] = Int32GetDatum(parallelism);
 	values[CONSUMER_ATTR_TIMEOUT - 1] = Int32GetDatum(timeout);
 	values[CONSUMER_ATTR_FORMAT - 1] = PointerGetDatum(format);
@@ -1282,6 +1289,7 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 	text *quote;
 	text *escape;
 	int batchsize;
+	int maxbytes;
 	int parallelism;
 	int timeout;
 	int64 offset;
@@ -1330,19 +1338,24 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 		batchsize = PG_GETARG_INT32(6);
 
 	if (PG_ARGISNULL(7))
-		parallelism = 1;
+		maxbytes = 32000000;
 	else
-		parallelism = PG_GETARG_INT32(7);
+		maxbytes = PG_GETARG_INT32(7);
 
 	if (PG_ARGISNULL(8))
-		timeout = 250;
+		parallelism = 1;
 	else
-		timeout = PG_GETARG_INT32(8);
+		parallelism = PG_GETARG_INT32(8);
 
 	if (PG_ARGISNULL(9))
+		timeout = 250;
+	else
+		timeout = PG_GETARG_INT32(9);
+
+	if (PG_ARGISNULL(10))
 		offset = RD_KAFKA_OFFSET_NULL;
 	else
-		offset = PG_GETARG_INT64(9);
+		offset = PG_GETARG_INT64(10);
 
 	/* there's no point in progressing if there aren't any brokers */
 	if (!get_all_brokers())
@@ -1361,7 +1374,7 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 
 	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
 	id = create_or_update_consumer(consumers, qualified_name, topic, format,
-			delimiter, quote, escape, batchsize, parallelism, timeout);
+			delimiter, quote, escape, batchsize, maxbytes, parallelism, timeout);
 	load_consumer_state(id, &consumer);
 	success = launch_consumer_group(&consumer, offset);
 	relinfo_close(consumers, NoLock);
