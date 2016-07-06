@@ -102,8 +102,8 @@ PG_MODULE_MAGIC;
 
 #define RD_KAFKA_OFFSET_NULL INT64_MIN
 
-#define CONSUMER_LOG_PREFIX "[pipeline_kafka consumer] %s <- %s (PID %d): "
-#define CONSUMER_LOG_PREFIX_PARAMS(consumer) consumer.rel->relname, consumer.topic, MyProcPid
+#define CONSUMER_LOG_PREFIX "[pipeline_kafka] %s <- %s (PID %d): "
+#define CONSUMER_LOG_PREFIX_PARAMS(consumer) (consumer)->rel->relname, (consumer)->topic, MyProcPid
 #define CONSUMER_WORKER_RESTART_TIME 1
 
 static volatile sig_atomic_t got_SIGTERM = false;
@@ -791,17 +791,36 @@ get_copy_statement(KafkaConsumer *consumer)
  *
  * Write messages to stream
  */
-static uint64
-execute_copy(CopyStmt *stmt, StringInfo buf)
+static void
+execute_copy(KafkaConsumer *consumer, KafkaConsumerProc *proc, CopyStmt *stmt, StringInfo buf, int num_messages)
 {
-	uint64 processed;
+	StartTransactionCommand();
 
-	copy_iter_hook = copy_next;
-	copy_iter_arg = buf;
+	/* we don't want to die in the event of any errors */
+	PG_TRY();
+	{
+		uint64 processed;
+		copy_iter_arg = buf;
+		DoCopy(stmt, "COPY", &processed);
+	}
+	PG_CATCH();
+	{
+		elog(LOG, CONSUMER_LOG_PREFIX "failed to process batch, dropped %d message%s",
+				CONSUMER_LOG_PREFIX_PARAMS(consumer), num_messages, (num_messages == 1 ? "" : "s"));
 
-	DoCopy(stmt, "COPY", &processed);
+		EmitErrorReport();
+		FlushErrorState();
 
-	return processed;
+		AbortCurrentTransaction();
+	}
+	PG_END_TRY();
+
+	if (!IsTransactionState())
+		StartTransactionCommand();
+
+	save_consumer_offsets(consumer, proc->partition_group);
+
+	CommitTransactionCommand();
 }
 
 /*
@@ -867,7 +886,7 @@ kafka_consume_main(Datum arg)
 	if (consumer.brokers == NIL)
 	{
 		elog(WARNING, CONSUMER_LOG_PREFIX "no brokers found in pipeline_kafka.brokers",
-				CONSUMER_LOG_PREFIX_PARAMS(consumer));
+				CONSUMER_LOG_PREFIX_PARAMS(&consumer));
 		goto done;
 	}
 
@@ -876,7 +895,7 @@ kafka_consume_main(Datum arg)
 
 	if (!valid_brokers)
 		elog(ERROR, CONSUMER_LOG_PREFIX "no valid brokers were found",
-				CONSUMER_LOG_PREFIX_PARAMS(consumer));
+				CONSUMER_LOG_PREFIX_PARAMS(&consumer));
 
 	/*
 	 * Set up our topic to read from
@@ -886,7 +905,7 @@ kafka_consume_main(Datum arg)
 
 	if (err != RD_KAFKA_RESP_ERR_NO_ERROR)
 		elog(ERROR, CONSUMER_LOG_PREFIX "failed to acquire metadata: %s",
-				CONSUMER_LOG_PREFIX_PARAMS(consumer), rd_kafka_err2str(err));
+				CONSUMER_LOG_PREFIX_PARAMS(&consumer), rd_kafka_err2str(err));
 
 	Assert(meta->topic_cnt == 1);
 	topic_meta = meta->topics[0];
@@ -905,11 +924,11 @@ kafka_consume_main(Datum arg)
 			continue;
 
 		elog(LOG, CONSUMER_LOG_PREFIX "consuming partition %d from offset %ld",
-				CONSUMER_LOG_PREFIX_PARAMS(consumer), partition, consumer.offsets[partition]);
+				CONSUMER_LOG_PREFIX_PARAMS(&consumer), partition, consumer.offsets[partition]);
 
 		if (rd_kafka_consume_start(topic, partition, consumer.offsets[partition]) == -1)
 			elog(ERROR, CONSUMER_LOG_PREFIX "failed to start consuming: %s",
-					CONSUMER_LOG_PREFIX_PARAMS(consumer), rd_kafka_err2str(rd_kafka_errno2err(errno)));
+					CONSUMER_LOG_PREFIX_PARAMS(&consumer), rd_kafka_err2str(rd_kafka_errno2err(errno)));
 
 		my_partitions++;
 	}
@@ -929,6 +948,9 @@ kafka_consume_main(Datum arg)
 				ALLOCSET_DEFAULT_INITSIZE,
 				ALLOCSET_DEFAULT_MAXSIZE);
 	messages = palloc0(sizeof(rd_kafka_message_t *) * consumer.batch_size);
+
+	/* set copy hook */
+	copy_iter_hook = copy_next;
 
 	/*
 	 * Consume messages until we are terminated
@@ -967,9 +989,9 @@ kafka_consume_main(Datum arg)
 					/* Ignore partition EOF internal error */
 					if (messages[i]->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
 						elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
-								CONSUMER_LOG_PREFIX_PARAMS(consumer), rd_kafka_err2str(messages[i]->err));
+								CONSUMER_LOG_PREFIX_PARAMS(&consumer), rd_kafka_err2str(messages[i]->err));
 				}
-				else if (messages[i]->len > 0)
+				else if (messages[i]->len)
 				{
 					appendBinaryStringInfo(buf, messages[i]->payload, messages[i]->len);
 
@@ -986,12 +1008,19 @@ kafka_consume_main(Datum arg)
 				rd_kafka_message_destroy(messages[i]);
 				messages[i] = NULL;
 			}
+
+			if (messages_buffered >= consumer.batch_size || buf->len > 65535)
+			{
+				execute_copy(&consumer, proc, copy, buf, messages_buffered);
+				resetStringInfo(buf);
+				messages_buffered = 0;
+			}
 		}
 
 		librdkerrs = error_buf_pop(&my_error_buf);
 		if (librdkerrs)
 			elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
-					CONSUMER_LOG_PREFIX_PARAMS(consumer), librdkerrs);
+					CONSUMER_LOG_PREFIX_PARAMS(&consumer), librdkerrs);
 
 		if (!messages_buffered)
 		{
@@ -999,31 +1028,7 @@ kafka_consume_main(Datum arg)
 			continue;
 		}
 
-		StartTransactionCommand();
-
-		/* we don't want to die in the event of any errors */
-		PG_TRY();
-		{
-			if (messages_buffered)
-				execute_copy(copy, buf);
-		}
-		PG_CATCH();
-		{
-			elog(LOG, CONSUMER_LOG_PREFIX "failed to process batch, dropped %d message%s",
-					CONSUMER_LOG_PREFIX_PARAMS(consumer), messages_buffered, (messages_buffered == 1 ? "" : "s"));
-			EmitErrorReport();
-			FlushErrorState();
-
-			AbortCurrentTransaction();
-		}
-		PG_END_TRY();
-
-		if (!IsTransactionState())
-			StartTransactionCommand();
-
-		save_consumer_offsets(&consumer, proc->partition_group);
-
-		CommitTransactionCommand();
+		execute_copy(&consumer, proc, copy, buf, messages_buffered);
 	}
 
 done:
