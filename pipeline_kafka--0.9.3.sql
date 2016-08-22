@@ -101,7 +101,7 @@ CREATE FUNCTION pipeline_kafka.consume_begin_stream_partitioned (
   delimiter    text    DEFAULT E'\t',
   quote        text    DEFAULT NULL,
   escape       text    DEFAULT NULL,
-  batchsize    integer DEFAULT 1000,
+  batchsize    integer DEFAULT 10000,
   maxbytes     integer DEFAULT 32000000, -- 32mb
   parallelism  integer DEFAULT 1,
   timeout      integer DEFAULT 250,
