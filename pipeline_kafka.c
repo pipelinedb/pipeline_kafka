@@ -62,8 +62,8 @@ PG_MODULE_MAGIC;
 #define CONSUMER_RELATION "consumers"
 #define CONSUMER_RELATION_NATTS		11
 #define CONSUMER_ATTR_ID	 		1
-#define CONSUMER_ATTR_RELATION 		2
-#define CONSUMER_ATTR_TOPIC			3
+#define CONSUMER_ATTR_TOPIC			2
+#define CONSUMER_ATTR_RELATION 		3
 #define CONSUMER_ATTR_FORMAT 		4
 #define CONSUMER_ATTR_DELIMITER 	5
 #define CONSUMER_ATTR_QUOTE			6
@@ -104,7 +104,8 @@ PG_MODULE_MAGIC;
 #define RD_KAFKA_OFFSET_NULL INT64_MIN
 
 #define CONSUMER_LOG_PREFIX "[pipeline_kafka] %s <- %s (PID %d): "
-#define CONSUMER_LOG_PREFIX_PARAMS(consumer) (consumer)->rel->relname, (consumer)->topic, MyProcPid
+#define CONSUMER_LOG_PREFIX_PARAMS(consumer) \
+	((consumer)->rel ? (consumer)->rel->relname : "*"), (consumer)->topic, MyProcPid
 #define CONSUMER_WORKER_RESTART_TIME 1
 
 static volatile sig_atomic_t got_SIGTERM = false;
@@ -527,6 +528,7 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 	bool isnull;
 	text *qualified;
 	MemoryContext old;
+	char *relname;
 
 	MemSet(consumer, 0, sizeof(KafkaConsumer));
 
@@ -552,7 +554,11 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 	d = slot_getattr(slot, CONSUMER_ATTR_RELATION, &isnull);
 	Assert(!isnull);
 	qualified = (text *) DatumGetPointer(d);
-	consumer->rel = makeRangeVarFromNameList(textToQualifiedNameList(qualified));
+	relname = text_to_cstring(qualified);
+	if (strlen(relname))
+		consumer->rel = makeRangeVarFromNameList(textToQualifiedNameList(qualified));
+	else
+		consumer->rel = NULL;
 
 	/* topic */
 	d = slot_getattr(slot, CONSUMER_ATTR_TOPIC, &isnull);
@@ -834,6 +840,271 @@ execute_copy(KafkaConsumer *consumer, KafkaConsumerProc *proc, CopyStmt *stmt, S
 	MemoryContextSwitchTo(old);
 }
 
+static void
+consumer_topic_to_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd_kafka_topic_t *topic)
+{
+	CopyStmt *copy;
+	rd_kafka_message_t **messages;
+	MemoryContext work_ctx = CurrentMemoryContext;
+
+	StartTransactionCommand();
+	copy = get_copy_statement(consumer);
+	CommitTransactionCommand();
+
+	messages = MemoryContextAlloc(CacheMemoryContext, sizeof(rd_kafka_message_t *) * consumer->batch_size);
+
+	/*
+	 * Consume messages until we are terminated
+	 */
+	while (!got_SIGTERM)
+	{
+		int num_consumed;
+		int i;
+		int messages_buffered = 0;
+		int partition;
+		char *librdkerrs;
+		StringInfo buf;
+
+		MemoryContextSwitchTo(work_ctx);
+		MemoryContextReset(work_ctx);
+
+		buf = makeStringInfo();
+
+		for (partition = 0; partition < consumer->num_partitions; partition++)
+		{
+			if (partition % consumer->parallelism != proc->partition_group)
+				continue;
+
+			num_consumed = rd_kafka_consume_batch(topic, partition,
+					consumer->timeout, messages, consumer->batch_size);
+
+			if (num_consumed <= 0)
+				continue;
+
+			for (i = 0; i < num_consumed; i++)
+			{
+				rd_kafka_message_t *message = messages[i];
+
+				Assert(message);
+
+				if (message->err)
+				{
+					/* Ignore partition EOF internal error */
+					if (message->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
+						elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
+								CONSUMER_LOG_PREFIX_PARAMS(consumer), rd_kafka_err2str(message->err));
+				}
+				else if (message->len)
+				{
+					appendBinaryStringInfo(buf, message->payload, message->len);
+
+					/* COPY expects a newline after each tuple, so add one if missing. */
+					if (buf->data[buf->len - 1] != '\n')
+						appendStringInfoChar(buf, '\n');
+
+					messages_buffered++;
+
+					Assert(message->offset >= consumer->offsets[partition]);
+					consumer->offsets[partition] = message->offset;
+				}
+
+				rd_kafka_message_destroy(message);
+				messages[i] = NULL;
+			}
+
+			/* Flush if we've buffered enough messages or space used by messages has exceeded buffer size threshold */
+			if (messages_buffered >= consumer->batch_size || buf->len >= consumer->max_bytes)
+			{
+				execute_copy(consumer, proc, copy, buf, messages_buffered);
+				resetStringInfo(buf);
+				messages_buffered = 0;
+			}
+		}
+
+		librdkerrs = error_buf_pop(&my_error_buf);
+		if (librdkerrs)
+			elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
+					CONSUMER_LOG_PREFIX_PARAMS(consumer), librdkerrs);
+
+		if (!messages_buffered)
+		{
+			pg_usleep(1000);
+			continue;
+		}
+
+		execute_copy(consumer, proc, copy, buf, messages_buffered);
+	}
+}
+
+typedef struct
+{
+	char *stream;
+	CopyStmt *copy;
+	StringInfo buf;
+	int num_messages;
+} per_stream_state;
+
+static void
+copy_to_streams(KafkaConsumer *consumer, KafkaConsumerProc *proc, HTAB *stream_state_hash)
+{
+	HASH_SEQ_STATUS scan;
+	per_stream_state *state;
+	List *to_process = NIL;
+	ListCell *lc;
+
+	hash_seq_init(&scan, stream_state_hash);
+	while ((state = (per_stream_state *) hash_seq_search(&scan)) != NULL)
+	{
+		if (!state->num_messages)
+			continue;
+
+		to_process = lappend(to_process, state);
+	}
+
+	foreach(lc, to_process)
+	{
+		per_stream_state *state = lfirst(lc);
+
+		execute_copy(consumer, proc, state->copy, state->buf, state->num_messages);
+		resetStringInfo(state->buf);
+		state->num_messages = 0;
+	}
+}
+
+static void
+consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd_kafka_topic_t *topic)
+{
+	rd_kafka_message_t **messages;
+	MemoryContext work_ctx = CurrentMemoryContext;
+	HASHCTL ctl;
+	HTAB *stream_state_hash;
+
+	messages = MemoryContextAlloc(CacheMemoryContext, sizeof(rd_kafka_message_t *) * consumer->batch_size);
+
+	ctl.keysize = sizeof(char *);
+	ctl.entrysize = sizeof(per_stream_state);
+	ctl.hcxt = CacheMemoryContext;
+
+	stream_state_hash = hash_create("stream_state_hash", 32, &ctl, HASH_ELEM | HASH_CONTEXT);
+
+	/*
+	 * Consume messages until we are terminated
+	 */
+	while (!got_SIGTERM)
+	{
+		int num_consumed;
+		int i;
+		int partition;
+		char *librdkerrs;
+		int messages_buffered = 0;
+		Size bytes_buffered = 0;
+
+		MemoryContextSwitchTo(work_ctx);
+		MemoryContextReset(work_ctx);
+
+		for (partition = 0; partition < consumer->num_partitions; partition++)
+		{
+			if (partition % consumer->parallelism != proc->partition_group)
+				continue;
+
+			num_consumed = rd_kafka_consume_batch(topic, partition,
+					consumer->timeout, messages, consumer->batch_size);
+
+			if (num_consumed <= 0)
+				continue;
+
+			for (i = 0; i < num_consumed; i++)
+			{
+				rd_kafka_message_t *message = messages[i];
+
+				Assert(message);
+
+				if (message->err)
+				{
+					/* Ignore partition EOF internal error */
+					if (message->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
+						elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
+								CONSUMER_LOG_PREFIX_PARAMS(consumer), rd_kafka_err2str(message->err));
+				}
+				else if (message->len)
+				{
+					char *key;
+					per_stream_state *state;
+					bool found;
+					StringInfo buf;
+
+					/* Kafka keys aren't null terminated, they're just bytes. So add +1 for null byte at the end */
+					key = palloc0(message->key_len + 1);
+					memcpy(key, message->key, message->key_len);
+
+					if (strlen(key) != message->key_len)
+						elog(LOG, CONSUMER_LOG_PREFIX "key is not a valid string", CONSUMER_LOG_PREFIX_PARAMS(consumer));
+
+					state = hash_search(stream_state_hash, key, HASH_ENTER, &found);
+					if (!found)
+					{
+						MemoryContext old;
+						List *name_list;
+
+						name_list = textToQualifiedNameList(cstring_to_text(key));
+
+						old = MemoryContextSwitchTo(CacheMemoryContext);
+
+						state->stream = pstrdup(key);
+						state->buf = makeStringInfo();
+						state->num_messages = 0;
+
+						consumer->rel = makeRangeVarFromNameList(name_list);
+
+						StartTransactionCommand();
+						state->copy = get_copy_statement(consumer);
+						CommitTransactionCommand();
+
+						consumer->rel = NULL;
+
+						MemoryContextSwitchTo(old);
+					}
+
+					buf = state->buf;
+
+					appendBinaryStringInfo(buf, message->payload, message->len);
+
+					/* COPY expects a newline after each tuple, so add one if missing. */
+					if (buf->data[buf->len - 1] != '\n')
+						appendStringInfoChar(buf, '\n');
+
+					state->num_messages++;
+					messages_buffered++;
+					bytes_buffered += message->len;
+
+					Assert(message->offset >= consumer->offsets[partition]);
+					consumer->offsets[partition] = message->offset;
+				}
+
+				rd_kafka_message_destroy(message);
+				messages[i] = NULL;
+			}
+
+			/* Flush if we've buffered enough messages or space used by messages has exceeded buffer size threshold */
+			if (messages_buffered >= consumer->batch_size || bytes_buffered >= consumer->max_bytes)
+				copy_to_streams(consumer, proc, stream_state_hash);
+		}
+
+		librdkerrs = error_buf_pop(&my_error_buf);
+		if (librdkerrs)
+			elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
+					CONSUMER_LOG_PREFIX_PARAMS(consumer), librdkerrs);
+
+		if (!messages_buffered)
+		{
+			pg_usleep(1000);
+			continue;
+		}
+
+		copy_to_streams(consumer, proc, stream_state_hash);
+	}
+}
+
 /*
  * kafka_consume_main
  *
@@ -846,7 +1117,6 @@ kafka_consume_main(Datum arg)
 	rd_kafka_topic_conf_t *topic_conf;
 	rd_kafka_t *kafka = NULL;
 	rd_kafka_topic_t *topic = NULL;
-	rd_kafka_message_t **messages;
 	const struct rd_kafka_metadata *meta;
 	struct rd_kafka_metadata_topic topic_meta;
 	rd_kafka_resp_err_t err;
@@ -855,7 +1125,6 @@ kafka_consume_main(Datum arg)
 	ListCell *lc;
 	KafkaConsumerProc *proc = hash_search(consumer_procs, &id, HASH_FIND, &found);
 	KafkaConsumer consumer;
-	CopyStmt *copy;
 	int valid_brokers = 0;
 	int i;
 	int my_partitions = 0;
@@ -887,7 +1156,6 @@ kafka_consume_main(Datum arg)
 	/* load saved consumer state */
 	StartTransactionCommand();
 	load_consumer_state(proc->consumer_id, &consumer);
-	copy = get_copy_statement(&consumer);
 
 	topic_conf = rd_kafka_topic_conf_new();
 	sprintf(val, "%d", consumer.max_bytes);
@@ -954,99 +1222,24 @@ kafka_consume_main(Datum arg)
 	*/
 	if (my_partitions == 0)
 	{
-		elog(LOG, CONSUMER_LOG_PREFIX "no partitions to read from",
-				consumer.rel->relname, consumer.topic, MyProcPid);
+		elog(LOG, CONSUMER_LOG_PREFIX "no partitions to read from", CONSUMER_LOG_PREFIX_PARAMS(&consumer));
 		goto done;
 	}
+
+	/* set copy hook */
+	copy_iter_hook = copy_next;
 
 	work_ctx = AllocSetContextCreate(TopMemoryContext, "KafkaConsumerContext",
 				ALLOCSET_DEFAULT_MINSIZE,
 				ALLOCSET_DEFAULT_INITSIZE,
 				ALLOCSET_DEFAULT_MAXSIZE);
-	messages = palloc0(sizeof(rd_kafka_message_t *) * consumer.batch_size);
 
-	/* set copy hook */
-	copy_iter_hook = copy_next;
+	MemoryContextSwitchTo(work_ctx);
 
-	/*
-	 * Consume messages until we are terminated
-	 */
-	while (!got_SIGTERM)
-	{
-		int num_consumed;
-		int i;
-		int messages_buffered = 0;
-		int partition;
-		char *librdkerrs;
-		StringInfo buf;
-
-		MemoryContextSwitchTo(work_ctx);
-		MemoryContextReset(work_ctx);
-
-		buf = makeStringInfo();
-
-		for (partition = 0; partition < consumer.num_partitions; partition++)
-		{
-			if (partition % consumer.parallelism != proc->partition_group)
-				continue;
-
-			num_consumed = rd_kafka_consume_batch(topic, partition,
-					consumer.timeout, messages, consumer.batch_size);
-
-			if (num_consumed <= 0)
-				continue;
-
-			for (i = 0; i < num_consumed; i++)
-			{
-				Assert(messages[i]);
-
-				if (messages[i]->err)
-				{
-					/* Ignore partition EOF internal error */
-					if (messages[i]->err != RD_KAFKA_RESP_ERR__PARTITION_EOF)
-						elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
-								CONSUMER_LOG_PREFIX_PARAMS(&consumer), rd_kafka_err2str(messages[i]->err));
-				}
-				else if (messages[i]->len)
-				{
-					appendBinaryStringInfo(buf, messages[i]->payload, messages[i]->len);
-
-					/* COPY expects a newline after each tuple, so add one if missing. */
-					if (buf->data[buf->len - 1] != '\n')
-						appendStringInfoChar(buf, '\n');
-
-					messages_buffered++;
-
-					Assert(messages[i]->offset >= consumer.offsets[partition]);
-					consumer.offsets[partition] = messages[i]->offset;
-				}
-
-				rd_kafka_message_destroy(messages[i]);
-				messages[i] = NULL;
-			}
-
-			/* Flush if we've buffered enough messages or space used by messages has exceeded buffer size threshold */
-			if (messages_buffered >= consumer.batch_size || buf->len >= consumer.max_bytes)
-			{
-				execute_copy(&consumer, proc, copy, buf, messages_buffered);
-				resetStringInfo(buf);
-				messages_buffered = 0;
-			}
-		}
-
-		librdkerrs = error_buf_pop(&my_error_buf);
-		if (librdkerrs)
-			elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
-					CONSUMER_LOG_PREFIX_PARAMS(&consumer), librdkerrs);
-
-		if (!messages_buffered)
-		{
-			pg_usleep(1000);
-			continue;
-		}
-
-		execute_copy(&consumer, proc, copy, buf, messages_buffered);
-	}
+	if (consumer.rel)
+		consumer_topic_to_relation(&consumer, proc, topic);
+	else
+		consume_topic_stream_partitioned(&consumer, proc, topic);
 
 done:
 	hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
@@ -1078,10 +1271,13 @@ create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 	IndexScanDesc scan;
 	bool isnull;
 
+	if (!relation)
+		relation = cstring_to_text("");
+
 	MemSet(nulls, false, sizeof(nulls));
 
-	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(relation));
-	ScanKeyInit(&skey[1], 2, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(topic));
+	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(topic));
+	ScanKeyInit(&skey[1], 2, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(relation));
 
 	scan = index_beginscan(consumers->ri_RelationDesc, consumers->ri_IndexRelationDescs[1],
 			GetTransactionSnapshot(), 2, 0);
@@ -1165,8 +1361,11 @@ get_consumer_id(ResultRelInfo *consumers, text *relation, text *topic)
 	IndexScanDesc scan;
 	int32 id = 0;
 
-	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(relation));
-	ScanKeyInit(&skey[1], 2, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(topic));
+	if (relation == NULL)
+		relation = cstring_to_text("");
+
+	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(topic));
+	ScanKeyInit(&skey[1], 2, BTEqualStrategyNumber, F_TEXTEQ, PointerGetDatum(relation));
 
 	scan = index_beginscan(consumers->ri_RelationDesc, consumers->ri_IndexRelationDescs[1],
 			GetTransactionSnapshot(), 2, 0);
@@ -1223,7 +1422,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		if (running)
 		{
 			elog(WARNING, "%s is already being consumed into relation %s",
-					consumer->topic, consumer->rel->relname);
+					consumer->topic, consumer->rel ? consumer->rel->relname : "*");
 			return true;
 		}
 
@@ -1262,7 +1461,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		sprintf(worker.bgw_library_name, PIPELINE_KAFKA_LIB);
 		sprintf(worker.bgw_function_name, KAFKA_CONSUME_MAIN);
 		snprintf(worker.bgw_name, BGW_MAXLEN, "[kafka consumer] %s <- %s",
-				consumer->rel->relname, consumer->topic);
+				consumer->rel ? consumer->rel->relname : "*", consumer->topic);
 
 		if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 			return false;
@@ -1274,13 +1473,13 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 }
 
 /*
- * kafka_consume_begin_tr
+ * kafka_consume_begin
  *
  * Begin consuming messages from the given topic into the given relation
  */
-PG_FUNCTION_INFO_V1(kafka_consume_begin_tr);
+PG_FUNCTION_INFO_V1(kafka_consume_begin);
 Datum
-kafka_consume_begin_tr(PG_FUNCTION_ARGS)
+kafka_consume_begin(PG_FUNCTION_ARGS)
 {
 	text *topic;
 	text *qualified_name;
@@ -1309,6 +1508,10 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(2))
 		elog(ERROR, "format cannot be null");
 
+	/* there's no point in progressing if there aren't any brokers */
+	if (!get_all_brokers())
+		elog(ERROR, "add at least one broker with pipeline_kafka.add_broker");
+
 	topic = PG_GETARG_TEXT_P(0);
 	qualified_name = PG_GETARG_TEXT_P(1);
 	format = PG_GETARG_TEXT_P(2);
@@ -1329,7 +1532,6 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 		format = (text *) CStringGetTextDatum(FORMAT_CSV);
 		delimiter = (text *)  CStringGetTextDatum(FORMAT_JSON_DELIMITER);
 		quote = (text *) CStringGetTextDatum(FORMAT_JSON_QUOTE);
-
 	}
 
 	if (PG_ARGISNULL(5))
@@ -1338,7 +1540,7 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 		escape = PG_GETARG_TEXT_P(5);
 
 	if (PG_ARGISNULL(6))
-		batchsize = 1000;
+		batchsize = 10000;
 	else
 		batchsize = PG_GETARG_INT32(6);
 
@@ -1362,14 +1564,9 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 	else
 		offset = PG_GETARG_INT64(10);
 
-	/* there's no point in progressing if there aren't any brokers */
-	if (!get_all_brokers())
-		elog(ERROR, "add at least one broker with pipeline_kafka.add_broker");
-
 	/* verify that the target relation actually exists */
 	relname = makeRangeVarFromNameList(textToQualifiedNameList(qualified_name));
 	rel = heap_openrv(relname, AccessShareLock);
-
 	heap_close(rel, NoLock);
 
 	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
@@ -1386,13 +1583,13 @@ kafka_consume_begin_tr(PG_FUNCTION_ARGS)
 }
 
 /*
- * kafka_consume_end_tr
+ * kafka_consume_end
  *
  * Stop consuming messages from the given topic into the given relation
  */
-PG_FUNCTION_INFO_V1(kafka_consume_end_tr);
+PG_FUNCTION_INFO_V1(kafka_consume_end);
 Datum
-kafka_consume_end_tr(PG_FUNCTION_ARGS)
+kafka_consume_end(PG_FUNCTION_ARGS)
 {
 	text *topic;
 	text *relation;
@@ -1789,4 +1986,149 @@ kafka_emit_tuple(PG_FUNCTION_ARGS)
 	}
 
 	return PointerGetDatum(tup);
+}
+
+/*
+ * kafka_consume_begin_stream_parititioned
+ */
+PG_FUNCTION_INFO_V1(kafka_consume_begin_stream_partitioned);
+Datum
+kafka_consume_begin_stream_partitioned(PG_FUNCTION_ARGS)
+{
+	text *topic;
+	ResultRelInfo *consumers;
+	Oid id;
+	bool success;
+	text *format;
+	text *delimiter;
+	text *quote;
+	text *escape;
+	int batchsize;
+	int maxbytes;
+	int parallelism;
+	int timeout;
+	int64 offset;
+	KafkaConsumer consumer;
+
+	check_pipeline_kafka_preloaded();
+
+	if (PG_ARGISNULL(0))
+		elog(ERROR, "topic cannot be null");
+	if (PG_ARGISNULL(1))
+		elog(ERROR, "format cannot be null");
+
+	/* there's no point in progressing if there aren't any brokers */
+	if (!get_all_brokers())
+		elog(ERROR, "add at least one broker with pipeline_kafka.add_broker");
+
+	topic = PG_GETARG_TEXT_P(0);
+	format = PG_GETARG_TEXT_P(1);
+
+	if (PG_ARGISNULL(2))
+		delimiter = NULL;
+	else
+		delimiter = PG_GETARG_TEXT_P(2);
+
+	if (PG_ARGISNULL(3))
+		quote = NULL;
+	else
+		quote = PG_GETARG_TEXT_P(3);
+
+	if (pg_strcasecmp(TextDatumGetCString(format), FORMAT_JSON) == 0)
+	{
+		pfree(format);
+		format = (text *) CStringGetTextDatum(FORMAT_CSV);
+		delimiter = (text *)  CStringGetTextDatum(FORMAT_JSON_DELIMITER);
+		quote = (text *) CStringGetTextDatum(FORMAT_JSON_QUOTE);
+	}
+
+	if (PG_ARGISNULL(4))
+		escape = NULL;
+	else
+		escape = PG_GETARG_TEXT_P(4);
+
+	if (PG_ARGISNULL(5))
+		batchsize = 10000;
+	else
+		batchsize = PG_GETARG_INT32(5);
+
+	if (PG_ARGISNULL(6))
+		maxbytes = 32000000;
+	else
+		maxbytes = PG_GETARG_INT32(6);
+
+	if (PG_ARGISNULL(7))
+		parallelism = 1;
+	else
+		parallelism = PG_GETARG_INT32(7);
+
+	if (PG_ARGISNULL(8))
+		timeout = 250;
+	else
+		timeout = PG_GETARG_INT32(8);
+
+	if (PG_ARGISNULL(9))
+		offset = RD_KAFKA_OFFSET_NULL;
+	else
+		offset = PG_GETARG_INT64(9);
+
+	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
+	id = create_or_update_consumer(consumers, NULL, topic, format,
+			delimiter, quote, escape, batchsize, maxbytes, parallelism, timeout);
+	load_consumer_state(id, &consumer);
+	success = launch_consumer_group(&consumer, offset);
+	relinfo_close(consumers, NoLock);
+
+	if (success)
+		RETURN_SUCCESS();
+	else
+		RETURN_FAILURE();
+}
+
+/*
+ * kafka_consume_end_stream_paritioned
+ */
+PG_FUNCTION_INFO_V1(kafka_consume_end_stream_partitioned);
+Datum
+kafka_consume_end_stream_partitioned(PG_FUNCTION_ARGS)
+{
+	text *topic;
+	ResultRelInfo *consumers;
+	int32 id;
+	bool found;
+	HASH_SEQ_STATUS iter;
+	KafkaConsumerProc *proc;
+	KafkaConsumerGroupKey key;
+
+	check_pipeline_kafka_preloaded();
+
+	if (PG_ARGISNULL(0))
+		elog(ERROR, "topic cannot be null");
+
+	topic = PG_GETARG_TEXT_P(0);
+	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
+
+	id = get_consumer_id(consumers, NULL, topic);
+	if (!id)
+		elog(ERROR, "there are no consumers for this topic and relation");
+
+	key.consumer_id = id;
+	key.db = MyDatabaseId;
+
+	hash_search(consumer_groups, &key, HASH_REMOVE, &found);
+	if (!found)
+		elog(ERROR, "no consumer processes are running for this topic and relation");
+
+	hash_seq_init(&iter, consumer_procs);
+	while ((proc = (KafkaConsumerProc *) hash_seq_search(&iter)) != NULL)
+	{
+		if (proc->consumer_id != id && proc->db == MyDatabaseId)
+			continue;
+
+		TerminateBackgroundWorker(&proc->worker);
+		hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
+	}
+
+	relinfo_close(consumers, NoLock);
+	RETURN_SUCCESS();
 }

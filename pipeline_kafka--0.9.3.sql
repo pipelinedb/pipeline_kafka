@@ -4,8 +4,8 @@
 -- Consumers added with pipeline_kafka.consume_begin
 CREATE TABLE pipeline_kafka.consumers (
   id          serial  PRIMARY KEY,
-  relation    text    NOT NULL,
   topic       text    NOT NULL,
+  relation    text    NOT NULL,
   format      text    NOT NULL,
   delimiter   text,
   quote       text,
@@ -14,7 +14,7 @@ CREATE TABLE pipeline_kafka.consumers (
   maxbytes    integer NOT NULL,
   parallelism integer NOT NULL,
   timeout     integer NOT NULL,
-  UNIQUE (relation, topic)
+  UNIQUE (topic, relation)
 );
 
 CREATE TABLE pipeline_kafka.offsets (
@@ -38,14 +38,14 @@ CREATE FUNCTION pipeline_kafka.consume_begin (
   delimiter    text    DEFAULT E'\t',
   quote        text    DEFAULT NULL,
   escape       text    DEFAULT NULL,
-  batchsize    integer DEFAULT 1000,
+  batchsize    integer DEFAULT 10000,
   maxbytes     integer DEFAULT 32000000, -- 32mb
   parallelism  integer DEFAULT 1,
   timeout      integer DEFAULT 250,
   start_offset bigint  DEFAULT NULL
 )
 RETURNS text
-AS 'MODULE_PATHNAME', 'kafka_consume_begin_tr'
+AS 'MODULE_PATHNAME', 'kafka_consume_begin'
 LANGUAGE C IMMUTABLE;
 
 CREATE FUNCTION pipeline_kafka.consume_end (
@@ -53,7 +53,7 @@ CREATE FUNCTION pipeline_kafka.consume_end (
   relation text
 )
 RETURNS text
-AS 'MODULE_PATHNAME', 'kafka_consume_end_tr'
+AS 'MODULE_PATHNAME', 'kafka_consume_end'
 LANGUAGE C IMMUTABLE;
 
 CREATE FUNCTION pipeline_kafka.consume_begin()
@@ -93,4 +93,27 @@ CREATE FUNCTION pipeline_kafka.remove_broker (
 )
 RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_remove_broker'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION pipeline_kafka.consume_begin_stream_partitioned (
+  topic        text,
+  format       text    DEFAULT 'text',
+  delimiter    text    DEFAULT E'\t',
+  quote        text    DEFAULT NULL,
+  escape       text    DEFAULT NULL,
+  batchsize    integer DEFAULT 1000,
+  maxbytes     integer DEFAULT 32000000, -- 32mb
+  parallelism  integer DEFAULT 1,
+  timeout      integer DEFAULT 250,
+  start_offset bigint  DEFAULT NULL
+)
+RETURNS text
+AS 'MODULE_PATHNAME', 'kafka_consume_begin_stream_partitioned'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION pipeline_kafka.consume_end_stream_partitioned (
+  topic    text
+)
+RETURNS text
+AS 'MODULE_PATHNAME', 'kafka_consume_end_stream_partitioned'
 LANGUAGE C IMMUTABLE;
