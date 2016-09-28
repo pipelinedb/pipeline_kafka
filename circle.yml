@@ -14,7 +14,7 @@ dependencies:
     - sudo service docker start
     - sudo pip install -r test/requirements.txt
     - make
-    - make install
+    - sudo make install
 
 test:
   override:
