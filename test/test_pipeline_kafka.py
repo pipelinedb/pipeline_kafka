@@ -12,9 +12,10 @@ def test_basic(pipeline, clean_db):
 
   # Let the topic get created lazily
   pipeline.produce('topic', '0')
-  time.sleep(2)
+  time.sleep(4)
 
   pipeline.consume_begin('topic', 'stream')
+  time.sleep(2)
 
   for n in range(1000):
     pipeline.produce('topic', str(n))

@@ -329,7 +329,6 @@ class PipelineDB(object):
     q = 'SELECT pipeline_kafka.consume_begin(%s)' % args
     self.execute(q)
     self.commit()
-    time.sleep(1)
 
 
 @pytest.fixture
