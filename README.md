@@ -1,4 +1,4 @@
-# pipeline_kafka ![Build Status](https://img.shields.io/circleci/token/db1a70c164cd6d96544d8eb38b279c48dea24709/project/pipelinedb/cerebro/master.svg?style=flat-square)
+# pipeline_kafka ![Build Status](https://img.shields.io/circleci/token/db1a70c164cd6d96544d8eb38b279c48dea24709/project/pipelinedb/pipeline_kafka/master.svg?style=flat-square)
 
 PipelineDB extension for Kafka support
 
