@@ -371,7 +371,7 @@ class KafkaCluster(object):
   def __init__(self, bin_dir='/opt/kafka_2.10-0.8.2.2/bin'):
     self.bin_dir = bin_dir
     self.topics = []
-    self.docker = docker.Client()
+    self.docker = docker.Client(version=os.environ.get('DOCKER_API_VERSION', 'auto'))
     self.brokers = ['localhost:9092', 'localhost:8092']
     self.client = KafkaClient(hosts=','.join(self.brokers))
 
