@@ -7,11 +7,13 @@ services:
     ports:
       - "2181:2181"
   kafka0:
-    image: wurstmeister/kafka
+    image: wurstmeister/kafka:0.8.2.2
     container_name: broker0
     network_mode: host
     environment:
       KAFKA_PORT: 9092
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_BROKER_ID: 0
       KAFKA_ADVERTISED_PORT: 9092
       KAFKA_ADVERTISED_HOST_NAME: localhost
       KAFKA_ZOOKEEPER_CONNECT: localhost:2181
@@ -25,6 +27,8 @@ services:
       - "8092:092"
     environment:
       KAFKA_PORT: 8092
+      KAFKA_DELETE_TOPIC_ENABLE: "true"
+      KAFKA_BROKER_ID: 1
       KAFKA_ADVERTISED_PORT: 8092
       KAFKA_ADVERTISED_HOST_NAME: localhost
       KAFKA_ZOOKEEPER_CONNECT: localhost:2181

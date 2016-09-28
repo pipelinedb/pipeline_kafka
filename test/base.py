@@ -1,3 +1,6 @@
+from pykafka import KafkaClient
+import atexit
+import docker
 import getpass
 import os
 import psycopg2
@@ -9,8 +12,6 @@ import subprocess
 import sys
 import threading
 import time
-
-from functools import wraps
 
 
 BOOTSTRAPPED_BASE = './.pdbbase'
@@ -314,6 +315,39 @@ class PipelineDB(object):
     Begin consuming with the given parameters
     """
     params = {
+      'delimiter': delimiter,
+      'quote': quote,
+      'format': format,
+      'escape': escape,
+      'batchsize': batchsize,
+      'maxbytes': maxbytes,
+      'parallelism': parallelism,
+      'start_offset': start_offset,
+    }
+    args = [repr(topic), repr(stream)]
+    args.extend(['%s := %s' % (k, v and repr(v).replace("'\\", "E'\\") or 'NULL') for k, v in params.items()])
+    args = ', '.join(args)
+
+    q = 'SELECT pipeline_kafka.consume_begin(%s)' % args
+    self.execute(q)
+    self.commit()
+    time.sleep(1)
+
+  def consume_end(self):
+    """
+    Stop all consumers
+    """
+    self.execute('SELECT pipeline_kafka.consume_end()')
+    time.sleep(1)
+
+  def consume_begin_stream_partitioned(self, topic, format='text', delimiter='\t',
+                    quote=None, escape=None, batchsize=1000,
+                    maxbytes=32000000, parallelism=1, start_offset=None):
+    """
+    Begin consuming a stream-partitioned topic with the given parameters
+    """
+    params = {
+      'delimiter': delimiter,
       'quote': quote,
       'format': format,
       'escape': escape,
@@ -322,13 +356,51 @@ class PipelineDB(object):
       'parallelism': parallelism,
       'start_offset': start_offset
     }
-    args = [repr(topic), repr(stream)]
-    args.extend(['%s := %s' % (k, v and repr(v) or 'NULL') for k, v in params.items()])
+    args = [repr(topic)]
+    args.extend(['%s := %s' % (k, v and repr(v).replace("'\\", "E'\\") or 'NULL') for k, v in params.items()])
     args = ', '.join(args)
 
-    q = 'SELECT pipeline_kafka.consume_begin(%s)' % args
+    q = 'SELECT pipeline_kafka.consume_begin_stream_partitioned(%s)' % args
     self.execute(q)
     self.commit()
+    time.sleep(1)
+
+
+class KafkaCluster(object):
+
+  def __init__(self, bin_dir='/opt/kafka_2.10-0.8.2.2/bin'):
+    self.bin_dir = bin_dir
+    self.topics = []
+    self.docker = docker.Client()
+    self.brokers = ['localhost:9092', 'localhost:8092']
+    self.client = KafkaClient(hosts=','.join(self.brokers))
+
+  def create_topic(self, name, partitions=1, replication_factor=1):
+    cmd = [os.path.join(self.bin_dir, 'kafka-topics.sh'),
+           '--create', '--topic', name,
+           '--zookeeper', 'localhost:2181',
+           '--partitions', str(partitions),
+           '--replication-factor', str(replication_factor)]
+    cmd = ' '.join(cmd)
+    cmd = self.docker.exec_create(container='broker0', cmd=cmd)
+    r = self.docker.exec_start(cmd['Id'])
+    self.topics.append(name)
+
+  def delete_topics(self):
+    for topic in self.topics:
+      cmd = [os.path.join(self.bin_dir, 'kafka-topics.sh'),
+             '--delete', '--topic', topic,
+             '--zookeeper', 'localhost:2181']
+      cmd = ' '.join(cmd)
+      cmd = self.docker.exec_create(container='broker0', cmd=cmd)
+      r = self.docker.exec_start(cmd['Id'])
+
+  def get_producer(self, topic):
+    topic = self.client.topics[topic]
+    producer = topic.get_producer()
+    atexit.register(lambda p: p.stop() if p._running else None, producer)
+
+    return producer
 
 
 @pytest.fixture
@@ -338,6 +410,12 @@ def clean_db(request):
   """
   pdb = request.module.pipeline
   request.addfinalizer(pdb.drop_all)
+  request.addfinalizer(pdb.consume_end)
+
+  pdb.execute('DROP EXTENSION pipeline_kafka')
+  pdb.execute('CREATE EXTENSION pipeline_kafka')
+  pdb.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
+  pdb.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
 
 
 @pytest.fixture(scope='module')
@@ -355,13 +433,22 @@ def pipeline(request):
   request.module.pipeline = pdb
   pdb.run()
 
-  pdb.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
-  pdb.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
-
   return pdb
 
 
-def eventually(fn, timeout=30, interval=0.01):
+@pytest.fixture(scope='module')
+def kafka(request):
+  """
+  Attaches to the running Dockerized Kafka cluster and supports
+  creating topics, which are all deleted when this fixture goes out of scope.
+  """
+  kafka = KafkaCluster()
+  request.addfinalizer(kafka.delete_topics)
+
+  return kafka
+
+
+def eventually(fn, timeout=120, interval=0.01):
   """
   Keep calling fn until it returns true or a timeout is reached, sleeping
   for the given interval after each failed attempt

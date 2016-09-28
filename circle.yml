@@ -1,0 +1,21 @@
+dependencies:
+  pre:
+    - sudo apt-get update
+    - sudo apt-get install python-dev
+    - curl -sSL https://s3.amazonaws.com/circle-downloads/install-circleci-docker.sh | bash -s -- 1.10.0
+    - sudo pip install --upgrade docker-compose
+    - wget https://www.pipelinedb.com/download/nightly/ubuntu14
+    - sudo dpkg -i ubuntu14
+    - git clone -b 0.8 https://github.com/edenhill/librdkafka.git
+    - cd librdkafka && ./configure --prefix=/usr && make && sudo make install
+
+  post:
+    - sudo service docker start
+    - sudo pip install -r test/requirements.txt
+
+test:
+  pre:
+    - sudo service postgresql stop
+  override:
+    - make test
+
