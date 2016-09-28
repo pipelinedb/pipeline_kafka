@@ -1,4 +1,5 @@
 /.cache
+/.kafka
 /__pycache__
 /.pdb*
 /*.pyc

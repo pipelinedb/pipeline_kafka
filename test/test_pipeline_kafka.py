@@ -1,5 +1,6 @@
 from base import kafka, pipeline, clean_db, eventually
 import json
+import subprocess
 import threading
 import time
 
@@ -220,3 +221,56 @@ def test_consume_json(pipeline, kafka, clean_db):
       assert k.replace('v', '') == arr_el
 
   assert eventually(unpack_cv)
+
+
+def test_broker_failure(pipeline, kafka, clean_db):
+  """
+  Create a replicated topic and kill one of the brokers to verify that
+  the consumer still reads all available data
+  """
+  pipeline.create_stream('stream', x='integer')
+  pipeline.create_cv('count_cv', 'SELECT x, COUNT(*) FROM stream GROUP BY x')
+
+  kafka.create_topic('test_broker_failure', partitions=4, replication_factor=2)
+  time.sleep(2)
+
+  pipeline.consume_begin('test_broker_failure', 'stream')
+  producer = kafka.get_producer('test_broker_failure', sync=True)
+
+  for n in range(100):
+    producer.produce(str(n))
+
+  def before_failure():
+    rows = pipeline.execute('SELECT sum(count) FROM count_cv')
+    assert rows[0][0] == 100
+
+    rows = pipeline.execute('SELECT count(*) FROM count_cv')
+    assert rows[0][0] == 100
+
+  assert eventually(before_failure)
+
+  # Kill one broker
+  p = subprocess.Popen(['docker', 'kill', 'broker0'])
+  p.communicate()
+
+  producer = kafka.get_producer('test_broker_failure', sync=True)
+
+  for n in range(100):
+    producer.produce(str(n))
+
+  def after_failure():
+    rows = pipeline.execute('SELECT sum(count) FROM count_cv')
+    assert rows[0][0] == 200
+
+    rows = pipeline.execute('SELECT count(*) FROM count_cv')
+    assert rows[0][0] == 100
+
+  assert eventually(after_failure)
+
+  # Bring the broker back up since other tests expect it
+  pipeline.consume_end()
+  p = subprocess.Popen(['docker-compose', 'stop'])
+  p.communicate()
+
+  p = subprocess.Popen(['docker-compose', 'up', '-d'])
+  p.communicate()

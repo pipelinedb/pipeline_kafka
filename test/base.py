@@ -1,6 +1,5 @@
 from pykafka import KafkaClient
 import atexit
-import docker
 import getpass
 import os
 import psycopg2
@@ -18,6 +17,7 @@ BOOTSTRAPPED_BASE = './.pdbbase'
 INSTALL_FORMAT = './.pdb-%d'
 CONNSTR_TEMPLATE = 'postgres://%s@localhost:%d/pipeline'
 PG_CONFIG = os.environ.get('PG_CONFIG', 'pg_config')
+KAFKA_URL = 'http://apache.claz.org/kafka/0.8.2.2/kafka_2.9.1-0.8.2.2.tgz'
 
 
 class PipelineDB(object):
@@ -371,9 +371,19 @@ class KafkaCluster(object):
   def __init__(self, bin_dir='/opt/kafka_2.10-0.8.2.2/bin'):
     self.bin_dir = bin_dir
     self.topics = []
-    self.docker = docker.Client(version=os.environ.get('DOCKER_API_VERSION', 'auto'))
     self.brokers = ['localhost:9092', 'localhost:8092']
     self.client = KafkaClient(hosts=','.join(self.brokers))
+
+    # We need to dynamically create and delete topics, which is surprisingly
+    # difficult to do with the available clients. So we just use the Kafka binaries
+    # directly for this :(
+    if not os.path.exists('.kafka'):
+      p = subprocess.Popen(['wget', KAFKA_URL])
+      stdout, stderr = p.communicate()
+      p = subprocess.Popen('tar -xf kafka* && rm *.tgz && mv kafka* .kafka', shell=True)
+      stdout, stderr = p.communicate()
+
+    self.bin_dir = os.path.abspath('./.kafka/bin')
 
   def create_topic(self, name, partitions=1, replication_factor=1):
     cmd = [os.path.join(self.bin_dir, 'kafka-topics.sh'),
@@ -381,9 +391,8 @@ class KafkaCluster(object):
            '--zookeeper', 'localhost:2181',
            '--partitions', str(partitions),
            '--replication-factor', str(replication_factor)]
-    cmd = ' '.join(cmd)
-    cmd = self.docker.exec_create(container='broker0', cmd=cmd)
-    r = self.docker.exec_start(cmd['Id'])
+    p = subprocess.Popen(cmd)
+    stdout, stderr = p.communicate()
     self.topics.append(name)
 
   def delete_topics(self):
@@ -391,13 +400,12 @@ class KafkaCluster(object):
       cmd = [os.path.join(self.bin_dir, 'kafka-topics.sh'),
              '--delete', '--topic', topic,
              '--zookeeper', 'localhost:2181']
-      cmd = ' '.join(cmd)
-      cmd = self.docker.exec_create(container='broker0', cmd=cmd)
-      r = self.docker.exec_start(cmd['Id'])
+      p = subprocess.Popen(cmd)
+      stdout, stderr = p.communicate()
 
-  def get_producer(self, topic):
+  def get_producer(self, topic, sync=False):
     topic = self.client.topics[topic]
-    producer = topic.get_producer()
+    producer = topic.get_producer(sync=sync)
     atexit.register(lambda p: p.stop() if p._running else None, producer)
 
     return producer
