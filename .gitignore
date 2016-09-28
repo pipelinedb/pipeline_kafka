@@ -34,7 +34,6 @@
 config.log
 
 # Eclipse
-.cproject
-.project
+.*project*
 .settings/
 *~

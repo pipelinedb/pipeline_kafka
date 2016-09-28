@@ -22,7 +22,7 @@ include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
 
-.PHONY: run
+.PHONY: test
 
-run:
-	docker-compose up --force-recreate
+test:
+	make -C test
