@@ -178,11 +178,11 @@ class PipelineDB(object):
     Drop all continuous queries and streams
     """
     for transform in self.execute('SELECT schema, name FROM pipeline_transforms()'):
-      self.execute('DROP CONTINUOUS TRANSFORM %s.%s CASCADE' % (transform['schema'], transform['name']))
+      self.execute('DROP CONTINUOUS TRANSFORM %s.%s CASCADE' % transform)
     for view in self.execute('SELECT schema, name FROM pipeline_views()'):
-      self.execute('DROP CONTINUOUS VIEW %s.%s CASCADE' % (view['schema'], view['name']))
+      self.execute('DROP CONTINUOUS VIEW %s.%s CASCADE' % view)
     for stream in self.execute('SELECT schema, name FROM pipeline_streams()'):
-      self.execute('DROP STREAM %s.%s CASCADE' % (stream['schema'], stream['name']))
+      self.execute('DROP STREAM %s.%s CASCADE' % stream)
 
   def create_cv(self, name, stmt, **kw):
     """
@@ -246,6 +246,9 @@ class PipelineDB(object):
     cur = self.conn.cursor()
     cur.execute(stmt)
 
+    if cur.rowcount < 0:
+      return []
+
     return cur.fetchall()
 
   def insert(self, target, desc, rows):
@@ -295,6 +298,39 @@ class PipelineDB(object):
   def get_bin_dir(self):
     return self.bin_dir
 
+  def produce(self, topic, message):
+    """
+    Produce the message(s) into the given topic
+    """
+    q = """
+    SELECT pipeline_kafka.produce_message('%s', '%s')
+    """ % (topic, message)
+    self.execute(q)
+
+  def consume_begin(self, topic, stream, format='text', delimiter='\t',
+                    quote=None, escape=None, batchsize=1000,
+                    maxbytes=32000000, parallelism=1, start_offset=None):
+    """
+    Begin consuming with the given parameters
+    """
+    params = {
+      'quote': quote,
+      'format': format,
+      'escape': escape,
+      'batchsize': batchsize,
+      'maxbytes': maxbytes,
+      'parallelism': parallelism,
+      'start_offset': start_offset
+    }
+    args = [repr(topic), repr(stream)]
+    args.extend(['%s := %s' % (k, v and repr(v) or 'NULL') for k, v in params.items()])
+    args = ', '.join(args)
+
+    q = 'SELECT pipeline_kafka.consume_begin(%s)' % args
+    self.execute(q)
+    self.commit()
+    time.sleep(1)
+
 
 @pytest.fixture
 def clean_db(request):
@@ -320,12 +356,27 @@ def pipeline(request):
   request.module.pipeline = pdb
   pdb.run()
 
+  pdb.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
+  pdb.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
+
   return pdb
 
 
-@pytest.fixture
-def kafka(request):
+def eventually(fn, timeout=30, interval=0.01):
   """
-  Per-test Kafka client
+  Keep calling fn until it returns true or a timeout is reached, sleeping
+  for the given interval after each failed attempt
   """
-  return 'KAFKA'
+  elapsed = 0
+  start = time.time()
+  while elapsed < timeout:
+    try:
+      fn()
+      return True
+    except:
+      if elapsed >= timeout:
+        raise
+      time.sleep(interval)
+    elapsed = time.time() - start
+
+  return False
