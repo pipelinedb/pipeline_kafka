@@ -2,7 +2,7 @@ dependencies:
   pre:
     - sudo apt-get update
     - sudo apt-get install python-dev
-    - sudo apt-get remove postgresql-9.5
+    - sudo apt-get remove postgresql-9.5 postgresql-client-9.5
     - curl -sSL https://s3.amazonaws.com/circle-downloads/install-circleci-docker.sh | bash -s -- 1.10.0
     - sudo pip install --upgrade docker-compose
     - wget https://www.pipelinedb.com/download/nightly/ubuntu14
