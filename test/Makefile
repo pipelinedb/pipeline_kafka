@@ -1,6 +1,7 @@
 .PHONY: run test
 
 test: run-kafka
+	py.test -v
 	docker-compose stop
 	
 run-kafka:
