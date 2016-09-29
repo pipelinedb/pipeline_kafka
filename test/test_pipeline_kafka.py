@@ -275,11 +275,9 @@ def test_broker_failure(pipeline, kafka, clean_db):
 
   def after_failure():
     rows = pipeline.execute('SELECT sum(count) FROM count_cv')
-    print 'sum', rows
     assert rows[0][0] == 200
 
     rows = pipeline.execute('SELECT count(*) FROM count_cv')
-    print 'count', rows
     assert rows[0][0] == 100
 
   assert eventually(after_failure)
