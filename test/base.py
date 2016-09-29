@@ -385,7 +385,15 @@ class KafkaCluster(object):
 
     self.bin_dir = os.path.abspath('./.kafka/bin')
 
+  def delete_topic(self, name):
+    cmd = [os.path.join(self.bin_dir, 'kafka-topics.sh'),
+           '--delete', '--topic', name,
+           '--zookeeper', 'localhost:2181']
+    p = subprocess.Popen(cmd)
+    stdout, stderr = p.communicate()
+
   def create_topic(self, name, partitions=1, replication_factor=1):
+    self.delete_topic(name)
     cmd = [os.path.join(self.bin_dir, 'kafka-topics.sh'),
            '--create', '--topic', name,
            '--zookeeper', 'localhost:2181',
@@ -397,11 +405,7 @@ class KafkaCluster(object):
 
   def delete_topics(self):
     for topic in self.topics:
-      cmd = [os.path.join(self.bin_dir, 'kafka-topics.sh'),
-             '--delete', '--topic', topic,
-             '--zookeeper', 'localhost:2181']
-      p = subprocess.Popen(cmd)
-      stdout, stderr = p.communicate()
+      self.delete_topic(topic)
 
   def get_producer(self, topic, sync=False):
     topic = self.client.topics[topic]

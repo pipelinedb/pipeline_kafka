@@ -24,7 +24,7 @@ services:
       service: kafka0
     container_name: broker1
     ports:
-      - "8092:092"
+      - "8092:9092"
     environment:
       KAFKA_PORT: 8092
       KAFKA_DELETE_TOPIC_ENABLE: "true"

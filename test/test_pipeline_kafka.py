@@ -251,15 +251,27 @@ def test_broker_failure(pipeline, kafka, clean_db):
 
   assert eventually(before_failure)
 
+  # Give replication a bit of time
+  time.sleep(10)
+
   # Kill one broker
   p = subprocess.Popen(['docker', 'kill', 'broker0'])
   p.communicate()
-  time.sleep(60)
+  time.sleep(10)
 
   producer = kafka.get_producer('test_broker_failure', sync=True)
 
   for n in range(100):
-    producer.produce(str(n))
+    # Retry here in case there are transient connection issues after
+    # killing a broker
+    start = time.time()
+    while time.time() - start < 10:
+      try:
+        producer.produce(str(n))
+        break
+      except:
+        time.sleep(1)
+        producer = kafka.get_producer('test_broker_failure', sync=True)
 
   def after_failure():
     rows = pipeline.execute('SELECT sum(count) FROM count_cv')
