@@ -252,6 +252,7 @@ def test_broker_failure(pipeline, kafka, clean_db):
   # Kill one broker
   p = subprocess.Popen(['docker', 'kill', 'broker0'])
   p.communicate()
+  time.sleep(10)
 
   producer = kafka.get_producer('test_broker_failure', sync=True)
 
