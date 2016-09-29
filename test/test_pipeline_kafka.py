@@ -252,12 +252,12 @@ def test_broker_failure(pipeline, kafka, clean_db):
   assert eventually(before_failure)
 
   # Give replication a bit of time
-  time.sleep(10)
+  time.sleep(60)
 
   # Kill one broker
   p = subprocess.Popen(['docker', 'kill', 'broker0'])
   p.communicate()
-  time.sleep(10)
+  time.sleep(30)
 
   producer = kafka.get_producer('test_broker_failure', sync=True)
 
