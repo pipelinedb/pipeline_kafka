@@ -1,4 +1,5 @@
 from pykafka import KafkaClient
+from pykafka.exceptions import LeaderNotAvailable
 import atexit
 import getpass
 import os
@@ -396,6 +397,7 @@ class KafkaCluster(object):
     self.delete_topic(name)
     cmd = [os.path.join(self.bin_dir, 'kafka-topics.sh'),
            '--create', '--topic', name,
+           '--config', 'min.insync.replicas=%d' % replication_factor,
            '--zookeeper', 'localhost:2181',
            '--partitions', str(partitions),
            '--replication-factor', str(replication_factor)]
@@ -408,6 +410,13 @@ class KafkaCluster(object):
       self.delete_topic(topic)
 
   def get_producer(self, topic, sync=False):
+    start = time.time()
+    while time.time() - start < 60:
+      try:
+        self.client = KafkaClient(hosts=','.join(self.brokers))
+        break
+      except LeaderNotAvailable:
+        time.sleep(1)
     topic = self.client.topics[topic]
     producer = topic.get_producer(sync=sync)
     atexit.register(lambda p: p.stop() if p._running else None, producer)
