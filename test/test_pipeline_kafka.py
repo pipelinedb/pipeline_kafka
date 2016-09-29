@@ -231,10 +231,12 @@ def test_broker_failure(pipeline, kafka, clean_db):
   pipeline.create_stream('stream', x='integer')
   pipeline.create_cv('count_cv', 'SELECT x, COUNT(*) FROM stream GROUP BY x')
 
-  kafka.create_topic('test_broker_failure', partitions=4, replication_factor=2)
+  kafka.create_topic('test_broker_failure', replication_factor=2)
   time.sleep(2)
 
   pipeline.consume_begin('test_broker_failure', 'stream')
+  time.sleep(2)
+
   producer = kafka.get_producer('test_broker_failure', sync=True)
 
   for n in range(100):
@@ -252,7 +254,7 @@ def test_broker_failure(pipeline, kafka, clean_db):
   # Kill one broker
   p = subprocess.Popen(['docker', 'kill', 'broker0'])
   p.communicate()
-  time.sleep(10)
+  time.sleep(60)
 
   producer = kafka.get_producer('test_broker_failure', sync=True)
 
