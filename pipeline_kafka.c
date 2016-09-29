@@ -4,7 +4,7 @@
  *
  *	  PipelineDB support for Kafka
  *
- * Copyright (c) 2015, PipelineDB
+ * Copyright (c) 2016, PipelineDB
  *
  * contrib/pipeline_kafka.c
  *
@@ -44,6 +44,7 @@
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/json.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -111,6 +112,7 @@ PG_MODULE_MAGIC;
 static volatile sig_atomic_t got_SIGTERM = false;
 static rd_kafka_t *MyKafka = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static char *broker_version;
 
 void _PG_init(void);
 
@@ -304,6 +306,14 @@ _PG_init(void)
 		elog(WARNING, "%s must be loaded via shared_preload_libraries", PIPELINE_KAFKA_LIB);
 		return;
 	}
+
+	DefineCustomStringVariable("pipeline_kafka.broker_version",
+			gettext_noop("Specifies the Kafka broker version for cases in which it can't be detected."),
+			NULL,
+			&broker_version,
+			NULL,
+			PGC_POSTMASTER, 0,
+			NULL, NULL, NULL);
 
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pipeline_kafka_shmem_startup;
@@ -1115,6 +1125,7 @@ kafka_consume_main(Datum arg)
 {
 	char err_msg[512];
 	rd_kafka_topic_conf_t *topic_conf;
+	rd_kafka_conf_t *conf;
 	rd_kafka_t *kafka = NULL;
 	rd_kafka_topic_t *topic = NULL;
 	const struct rd_kafka_metadata *meta;
@@ -1161,7 +1172,11 @@ kafka_consume_main(Datum arg)
 	sprintf(val, "%d", consumer.max_bytes);
 	rd_kafka_topic_conf_set(topic_conf, "fetch.message.max.bytes", val, errstr, sizeof(errstr));
 
-	kafka = rd_kafka_new(RD_KAFKA_CONSUMER, NULL, err_msg, sizeof(err_msg));
+	conf = rd_kafka_conf_new();
+	if (broker_version)
+		rd_kafka_conf_set(conf, "broker.version.fallback", broker_version, NULL, 0);
+
+	kafka = rd_kafka_new(RD_KAFKA_CONSUMER, conf, err_msg, sizeof(err_msg));
 	rd_kafka_set_logger(kafka, consumer_logger);
 
 	/*

@@ -7,7 +7,7 @@ dependencies:
     - sudo pip install --upgrade docker-compose
     - wget https://www.pipelinedb.com/download/nightly/ubuntu14
     - sudo rm /usr/bin/psql && sudo rm /usr/bin/pg_config && sudo dpkg -i ubuntu14
-    - git clone -b 0.8 https://github.com/edenhill/librdkafka.git
+    - git clone -b 0.9.1 https://github.com/edenhill/librdkafka.git
     - cd librdkafka && ./configure --prefix=/usr && make && sudo make install
 
   post:

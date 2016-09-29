@@ -9,7 +9,7 @@ REGRESS = pipeline_kafka
 LIB_RDKAFKA_STATIC ?= /usr/lib/librdkafka.a
 
 SHLIB_LINK += $(LIB_RDKAFKA_STATIC)
-SHLIB_LINK += -lz -lpthread
+SHLIB_LINK += -lz -lpthread -lssl
 
 ifndef NO_PGXS
 PG_CONFIG = pg_config
