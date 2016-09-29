@@ -411,7 +411,7 @@ class KafkaCluster(object):
 
   def get_producer(self, topic, sync=False):
     start = time.time()
-    while time.time() - start < 60:
+    while time.time() - start < 5 * 60:
       try:
         self.client = KafkaClient(hosts=','.join(self.brokers))
         break
