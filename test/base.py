@@ -414,14 +414,12 @@ class KafkaCluster(object):
     while time.time() - start < 5 * 60:
       try:
         self.client = KafkaClient(hosts=','.join(self.brokers))
-        break
+        topic = self.client.topics[topic]
+        producer = topic.get_producer(sync=sync)
+        atexit.register(lambda p: p.stop() if p._running else None, producer)
+        return producer
       except LeaderNotAvailable:
         time.sleep(1)
-    topic = self.client.topics[topic]
-    producer = topic.get_producer(sync=sync)
-    atexit.register(lambda p: p.stop() if p._running else None, producer)
-
-    return producer
 
 
 @pytest.fixture
