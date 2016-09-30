@@ -223,8 +223,80 @@ def test_consume_json(pipeline, kafka, clean_db):
   assert eventually(unpack_cv)
 
 
-def test_grouped_consumer():
+def test_grouped_consumer(pipeline, kafka, clean_db):
   """
   Verify that consumers with a group.id store offsets in Kafka and consume
   partitions correctly.
   """
+  pipeline.create_stream('stream0', x='integer')
+  pipeline.create_stream('stream1', x='integer')
+  pipeline.create_cv('group0', "SELECT x, COUNT(*) FROM stream0 GROUP BY x")
+  pipeline.create_cv('group1', "SELECT x, COUNT(*) FROM stream1 GROUP BY x")
+
+  kafka.create_topic('topic0', partitions=4)
+  kafka.create_topic('topic1', partitions=4)
+
+  pipeline.consume_begin('topic0', 'stream0', group_id='group0')
+  pipeline.consume_begin('topic1', 'stream1', group_id='group1')
+
+  producer0 = kafka.get_producer('topic0')
+  producer1 = kafka.get_producer('topic1')
+
+  for n in range(1, 101):
+    producer0.produce(str(n))
+    producer1.produce(str(n))
+
+  def counts():
+    rows = pipeline.execute('SELECT sum(count) FROM group0')
+    assert rows[0][0] == 100
+
+    rows = pipeline.execute('SELECT sum(count) FROM group1')
+    assert rows[0][0] == 100
+
+    rows = pipeline.execute('SELECT count(*) FROM group0')
+    assert rows[0][0] == 100
+
+    rows = pipeline.execute('SELECT count(*) FROM group1')
+    assert rows[0][0] == 100
+
+  assert eventually(counts)
+
+  pipeline.consume_end()
+
+  # Verify offsets aren't stored locally
+  rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets')
+  assert not rows
+
+  # Now produce some more
+  for n in range(1, 101):
+    producer0.produce(str(-n))
+    producer1.produce(str(-n))
+
+  pipeline.consume_begin('topic0', 'stream0', group_id='group0')
+  pipeline.consume_begin('topic1', 'stream1', group_id='group1')
+
+  # And verify that only the second batch of messages was read
+  def counts_after_restart():
+    rows = pipeline.execute('SELECT sum(x) FROM group0')
+    assert rows[0][0] == 0
+
+    rows = pipeline.execute('SELECT sum(x) FROM group1')
+    assert rows[0][0] == 0
+
+    rows = pipeline.execute('SELECT sum(count) FROM group0')
+    assert rows[0][0] == 200
+
+    rows = pipeline.execute('SELECT sum(count) FROM group1')
+    assert rows[0][0] == 200
+
+    rows = pipeline.execute('SELECT count(*) FROM group0')
+    assert rows[0][0] == 200
+
+    rows = pipeline.execute('SELECT count(*) FROM group1')
+    assert rows[0][0] == 200
+
+  assert eventually(counts_after_restart)
+
+  # Verify that offsets still aren't stored locally
+  rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets')
+  assert not rows

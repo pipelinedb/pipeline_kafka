@@ -114,6 +114,7 @@ static volatile sig_atomic_t got_SIGTERM = false;
 static rd_kafka_t *MyKafka = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static char *broker_version = NULL;
+static char *consumer_config = NULL;
 
 void _PG_init(void);
 
@@ -238,8 +239,6 @@ typedef struct KafkaConsumer
 	int num_partitions;
 	int64_t *offsets;
 	rd_kafka_t *kafka;
-	rd_kafka_topic_partition_list_t *partitions;
-	rd_kafka_topic_t *rd_topic;
 } KafkaConsumer;
 
 /* Shared-memory hashtable for storing consumer process group information */
@@ -316,6 +315,14 @@ _PG_init(void)
 			gettext_noop("Specifies the Kafka broker version for cases in which it can't be detected."),
 			NULL,
 			&broker_version,
+			NULL,
+			PGC_POSTMASTER, 0,
+			NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pipeline_kafka.consumer_config",
+			gettext_noop("Comma-separated list of key-value pairs to override the default librdkafka configuration with."),
+			NULL,
+			&consumer_config,
 			NULL,
 			PGC_POSTMASTER, 0,
 			NULL, NULL, NULL);
@@ -645,8 +652,6 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 	ExecDropSingleTupleTableSlot(slot);
 	index_endscan(scan);
 	relinfo_close(consumers, NoLock);
-
-	consumer->partitions = rd_kafka_topic_partition_list_new(1);
 }
 
 /*
@@ -895,7 +900,6 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 	copy = get_copy_statement(consumer);
 	CommitTransactionCommand();
 
-	consumer->rd_topic = topic;
 	messages = MemoryContextAlloc(CacheMemoryContext, sizeof(rd_kafka_message_t *) * consumer->batch_size);
 
 	/*
@@ -1214,7 +1218,47 @@ kafka_consume_main(Datum arg)
 	{
 		rd_kafka_conf_set(conf, "group.id", consumer.group_id, NULL, 0);
 		rd_kafka_conf_set(conf, "offset.store.method", "broker", NULL, 0);
-		rd_kafka_topic_conf_set(topic_conf, "topic.auto.offset.reset", "smallest", NULL, 0);
+		rd_kafka_topic_conf_set(topic_conf, "topic.auto.offset.reset", "latest", NULL, 0);
+	}
+
+	/*
+	 * Override consumer configuration with anying specified by pipeline_kafka.consumer_config
+	 */
+	if (consumer_config)
+	{
+		List *opts;
+		ListCell *lc;
+
+		if (!SplitIdentifierString(consumer_config, ',', &opts))
+			elog(ERROR, "failed to parse pipeline_kafka.consumer_config");
+
+		foreach(lc, opts)
+		{
+			List *pair;
+			char *kv = (char *) lfirst(lc);
+			char *k;
+			char *v;
+
+			if (!SplitIdentifierString(kv, '=', &pair))
+			{
+				elog(WARNING, "malformed configuration key-value pair: %s, ignoring", kv);
+				continue;
+			}
+
+			if (list_length(pair) != 2)
+			{
+				elog(WARNING, "malformed configuration key-value pair: %s, ignoring", kv);
+				continue;
+			}
+
+			k = (char *) linitial(pair);
+			v = (char *) lsecond(pair);
+
+			if (!strncmp(k, "topic.", strlen("topic.")) == 0)
+				rd_kafka_topic_conf_set(topic_conf, k, v, NULL, 0);
+			else
+				rd_kafka_conf_set(conf, k, v, NULL, 0);
+		}
 	}
 
 	consumer.kafka = rd_kafka_new(RD_KAFKA_CONSUMER, conf, err_msg, sizeof(err_msg));
@@ -1261,15 +1305,31 @@ kafka_consume_main(Datum arg)
 	{
 		int partition = topic_meta.partitions[i].id;
 		int64_t start_offset;
+		int64_t log_start_offset;
 
 		Assert(partition <= consumer.num_partitions);
 		if (partition % consumer.parallelism != proc->partition_group)
 			continue;
 
-		start_offset = consumer.group_id ? RD_KAFKA_OFFSET_STORED : consumer.offsets[partition];
+		if (consumer.group_id)
+		{
+			/*
+			 * Query the offsets so we can log them here instead of logging a cryptic RD_KAFKA_OFFSET_STORED
+			 * as the start offset
+			 */
+			rd_kafka_topic_partition_list_t *topics = rd_kafka_topic_partition_list_new(1);
+			rd_kafka_topic_partition_list_add(topics, consumer.topic, partition);
+			rd_kafka_committed(consumer.kafka, topics, -1);
+			log_start_offset = topics->elems[0].offset;
+			start_offset = RD_KAFKA_OFFSET_STORED;
+		}
+		else
+		{
+			start_offset = log_start_offset = consumer.offsets[partition];
+		}
 
 		elog(LOG, CONSUMER_LOG_PREFIX "consuming partition %d from offset %ld",
-				CONSUMER_LOG_PREFIX_PARAMS(&consumer), partition, start_offset);
+				CONSUMER_LOG_PREFIX_PARAMS(&consumer), partition, log_start_offset);
 
 		if (rd_kafka_consume_start(topic, partition, start_offset) == -1)
 			elog(ERROR, CONSUMER_LOG_PREFIX "failed to start consuming: %s",
@@ -1277,6 +1337,10 @@ kafka_consume_main(Datum arg)
 
 		my_partitions++;
 	}
+
+	if (consumer.group_id)
+		elog(LOG, CONSUMER_LOG_PREFIX "group.id is \"%s\"",
+				CONSUMER_LOG_PREFIX_PARAMS(&consumer), consumer.group_id);
 
 	/*
 	* No point doing anything if we don't have any partitions assigned to us
