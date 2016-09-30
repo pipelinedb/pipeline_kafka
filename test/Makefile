@@ -5,7 +5,7 @@ test: run-kafka
 	docker-compose stop
 	
 run-kafka:
-	docker-compose rm -f
+	docker-compose rm -f --all
 	docker-compose up -d --force-recreate
 
 clean:

@@ -61,18 +61,19 @@ PG_MODULE_MAGIC;
 #define PIPELINE_KAFKA_SCHEMA "pipeline_kafka"
 
 #define CONSUMER_RELATION "consumers"
-#define CONSUMER_RELATION_NATTS		11
+#define CONSUMER_RELATION_NATTS		12
 #define CONSUMER_ATTR_ID	 		1
 #define CONSUMER_ATTR_TOPIC			2
 #define CONSUMER_ATTR_RELATION 		3
-#define CONSUMER_ATTR_FORMAT 		4
-#define CONSUMER_ATTR_DELIMITER 	5
-#define CONSUMER_ATTR_QUOTE			6
-#define CONSUMER_ATTR_ESCAPE		7
-#define CONSUMER_ATTR_BATCH_SIZE 	8
-#define CONSUMER_ATTR_MAX_BYTES 	9
-#define CONSUMER_ATTR_PARALLELISM 	10
-#define CONSUMER_ATTR_TIMEOUT	 	11
+#define CONSUMER_ATTR_GROUP_ID	4
+#define CONSUMER_ATTR_FORMAT 		5
+#define CONSUMER_ATTR_DELIMITER 	6
+#define CONSUMER_ATTR_QUOTE			7
+#define CONSUMER_ATTR_ESCAPE		8
+#define CONSUMER_ATTR_BATCH_SIZE 	9
+#define CONSUMER_ATTR_MAX_BYTES 	10
+#define CONSUMER_ATTR_PARALLELISM 	11
+#define CONSUMER_ATTR_TIMEOUT	 	12
 
 #define OFFSETS_RELATION "offsets"
 #define OFFSETS_RELATION_NATTS	3
@@ -106,13 +107,14 @@ PG_MODULE_MAGIC;
 
 #define CONSUMER_LOG_PREFIX "[pipeline_kafka] %s <- %s (PID %d): "
 #define CONSUMER_LOG_PREFIX_PARAMS(consumer) \
-	((consumer)->rel ? (consumer)->rel->relname : "*"), (consumer)->topic, MyProcPid
+	((consumer)->rel ? (consumer)->rel->relname : "*"), (consumer)->topic_name, MyProcPid
 #define CONSUMER_WORKER_RESTART_TIME 1
 
 static volatile sig_atomic_t got_SIGTERM = false;
 static rd_kafka_t *MyKafka = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
-static char *broker_version;
+static char *broker_version = NULL;
+static char *consumer_config = NULL;
 
 void _PG_init(void);
 
@@ -221,7 +223,7 @@ typedef struct KafkaConsumer
 {
 	int32 id;
 	List *brokers;
-	char *topic;
+	char *topic_name;
 	RangeVar *rel;
 	int32_t partition;
 	int64_t offset;
@@ -229,12 +231,15 @@ typedef struct KafkaConsumer
 	int max_bytes;
 	int parallelism;
 	int timeout;
+	char *group_id;
 	char *format;
 	char *delimiter;
 	char *quote;
 	char *escape;
 	int num_partitions;
 	int64_t *offsets;
+	rd_kafka_t *kafka;
+	rd_kafka_topic_t *topic;
 } KafkaConsumer;
 
 /* Shared-memory hashtable for storing consumer process group information */
@@ -311,6 +316,14 @@ _PG_init(void)
 			gettext_noop("Specifies the Kafka broker version for cases in which it can't be detected."),
 			NULL,
 			&broker_version,
+			NULL,
+			PGC_POSTMASTER, 0,
+			NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pipeline_kafka.consumer_config",
+			gettext_noop("Comma-separated list of key-value pairs to override the default librdkafka configuration with."),
+			NULL,
+			&consumer_config,
 			NULL,
 			PGC_POSTMASTER, 0,
 			NULL, NULL, NULL);
@@ -455,14 +468,9 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
 	ScanKeyData skey[1];
 	HeapTuple tup = NULL;
 	IndexScanDesc scan;
-	ResultRelInfo *offsets = relinfo_open(get_rangevar(OFFSETS_RELATION), RowExclusiveLock);
-	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(offsets->ri_RelationDesc));
+	ResultRelInfo *offsets;
+	TupleTableSlot *slot;
 	int i;
-
-	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(consumer->id));
-	scan = index_beginscan(offsets->ri_RelationDesc, offsets->ri_IndexRelationDescs[1],
-			GetTransactionSnapshot(), 1, 0);
-	index_rescan(scan, skey, 1, NULL, 0);
 
 	old = MemoryContextSwitchTo(CacheMemoryContext);
 	consumer->offsets = palloc0(meta->partition_cnt * sizeof(int64_t));
@@ -472,7 +480,19 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
 	for (i = 0; i < meta->partition_cnt; i++)
 		consumer->offsets[i] = start_offset;
 
-	consumer->num_partitions = meta->partition_cnt;
+	/*
+	 * Consumers with a group get their offsets from brokers
+	 */
+	if (consumer->group_id)
+		return;
+
+	offsets = relinfo_open(get_rangevar(OFFSETS_RELATION), RowExclusiveLock);
+	slot = MakeSingleTupleTableSlot(RelationGetDescr(offsets->ri_RelationDesc));
+
+	ScanKeyInit(&skey[0], 1, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(consumer->id));
+	scan = index_beginscan(offsets->ri_RelationDesc, offsets->ri_IndexRelationDescs[1],
+			GetTransactionSnapshot(), 1, 0);
+	index_rescan(scan, skey, 1, NULL, 0);
 
 	while ((tup = index_getnext(scan, ForwardScanDirection)) != NULL)
 	{
@@ -573,7 +593,14 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 	/* topic */
 	d = slot_getattr(slot, CONSUMER_ATTR_TOPIC, &isnull);
 	Assert(!isnull);
-	consumer->topic = TextDatumGetCString(d);
+	consumer->topic_name = TextDatumGetCString(d);
+
+	/* consumer group id */
+	d = slot_getattr(slot, CONSUMER_ATTR_GROUP_ID, &isnull);
+	if (!isnull)
+		consumer->group_id = TextDatumGetCString(d);
+	else
+		consumer->group_id = NULL;
 
 	/* format */
 	d = slot_getattr(slot, CONSUMER_ATTR_FORMAT, &isnull);
@@ -661,13 +688,38 @@ save_consumer_offsets(KafkaConsumer *consumer, int partition_group)
 	ScanKeyData skey[1];
 	HeapTuple tup = NULL;
 	IndexScanDesc scan;
-	ResultRelInfo *offsets = relinfo_open(get_rangevar(OFFSETS_RELATION), RowExclusiveLock);
+	ResultRelInfo *offsets;
 	Datum values[OFFSETS_RELATION_NATTS];
 	bool nulls[OFFSETS_RELATION_NATTS];
 	bool replace[OFFSETS_RELATION_NATTS];
 	bool updated[consumer->num_partitions];
-	TupleTableSlot *slot = MakeSingleTupleTableSlot(RelationGetDescr(offsets->ri_RelationDesc));
+	TupleTableSlot *slot;
 	int partition;
+
+	/*
+	 * Consumers with a group store offsets in brokers
+	 */
+	if (consumer->group_id)
+	{
+		for (partition = 0; partition < consumer->num_partitions; partition++)
+		{
+			rd_kafka_resp_err_t err;
+
+			if (partition % consumer->parallelism != partition_group)
+				continue;
+
+			err = rd_kafka_offset_store(consumer->topic, partition, consumer->offsets[partition]);
+			if (err)
+			{
+				elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
+						CONSUMER_LOG_PREFIX_PARAMS(consumer), rd_kafka_err2str(err));
+			}
+		}
+		return;
+	}
+
+	offsets = relinfo_open(get_rangevar(OFFSETS_RELATION), RowExclusiveLock);
+	slot = MakeSingleTupleTableSlot(RelationGetDescr(offsets->ri_RelationDesc));
 
 	MemSet(updated, false, sizeof(updated));
 
@@ -843,6 +895,10 @@ execute_copy(KafkaConsumer *consumer, KafkaConsumerProc *proc, CopyStmt *stmt, S
 	if (!IsTransactionState())
 		StartTransactionCommand();
 
+	/*
+	 * We only store offsets if we're not part of a consumer group.
+	 * Consumer groups store their offsets in Kafka.
+	 */
 	save_consumer_offsets(consumer, proc->partition_group);
 
 	CommitTransactionCommand();
@@ -1116,6 +1172,48 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 }
 
 /*
+ * configure_consumer
+ */
+static void
+configure_consumer(rd_kafka_conf_t *conf, rd_kafka_topic_conf_t *topic_conf)
+{
+	List *opts;
+	ListCell *lc;
+
+	Assert(consumer_config);
+
+	if (!SplitIdentifierString(consumer_config, ',', &opts))
+		elog(ERROR, "failed to parse pipeline_kafka.consumer_config");
+
+	foreach(lc, opts)
+	{
+		List *pair;
+		char *kv = (char *) lfirst(lc);
+		char *k;
+		char *v;
+
+		if (!SplitIdentifierString(kv, '=', &pair))
+		{
+			elog(WARNING, "malformed configuration key-value pair: %s, ignoring", kv);
+			continue;
+		}
+
+		if (list_length(pair) != 2)
+		{
+			elog(WARNING, "malformed configuration key-value pair: %s, ignoring", kv);
+			continue;
+		}
+
+		k = (char *) linitial(pair);
+		v = (char *) lsecond(pair);
+
+		if (!strncmp(k, "topic.", strlen("topic.")) == 0)
+			rd_kafka_topic_conf_set(topic_conf, k, v, NULL, 0);
+		else
+			rd_kafka_conf_set(conf, k, v, NULL, 0);
+	}
+}
+/*
  * kafka_consume_main
  *
  * Main function for Kafka consumers running as background workers
@@ -1126,8 +1224,6 @@ kafka_consume_main(Datum arg)
 	char err_msg[512];
 	rd_kafka_topic_conf_t *topic_conf;
 	rd_kafka_conf_t *conf;
-	rd_kafka_t *kafka = NULL;
-	rd_kafka_topic_t *topic = NULL;
 	const struct rd_kafka_metadata *meta;
 	struct rd_kafka_metadata_topic topic_meta;
 	rd_kafka_resp_err_t err;
@@ -1176,8 +1272,22 @@ kafka_consume_main(Datum arg)
 	if (broker_version)
 		rd_kafka_conf_set(conf, "broker.version.fallback", broker_version, NULL, 0);
 
-	kafka = rd_kafka_new(RD_KAFKA_CONSUMER, conf, err_msg, sizeof(err_msg));
-	rd_kafka_set_logger(kafka, consumer_logger);
+	if (consumer.group_id)
+	{
+		rd_kafka_conf_set(conf, "group.id", consumer.group_id, NULL, 0);
+		rd_kafka_conf_set(conf, "offset.store.method", "broker", NULL, 0);
+		rd_kafka_conf_set(conf, "auto.commit.enable ", "false", NULL, 0);
+		rd_kafka_topic_conf_set(topic_conf, "topic.auto.offset.reset", "latest", NULL, 0);
+	}
+
+	/*
+	 * Override consumer configuration with anying specified by pipeline_kafka.consumer_config
+	 */
+	if (consumer_config)
+		configure_consumer(conf, topic_conf);
+
+	consumer.kafka = rd_kafka_new(RD_KAFKA_CONSUMER, conf, err_msg, sizeof(err_msg));
+	rd_kafka_set_logger(consumer.kafka, consumer_logger);
 
 	/*
 	 * Add all brokers currently in pipeline_kafka.brokers
@@ -1190,7 +1300,7 @@ kafka_consume_main(Datum arg)
 	}
 
 	foreach(lc, consumer.brokers)
-		valid_brokers += rd_kafka_brokers_add(kafka, lfirst(lc));
+		valid_brokers += rd_kafka_brokers_add(consumer.kafka, lfirst(lc));
 
 	if (!valid_brokers)
 		elog(ERROR, CONSUMER_LOG_PREFIX "no valid brokers were found",
@@ -1199,8 +1309,8 @@ kafka_consume_main(Datum arg)
 	/*
 	 * Set up our topic to read from
 	 */
-	topic = rd_kafka_topic_new(kafka, consumer.topic, topic_conf);
-	err = rd_kafka_metadata(kafka, false, topic, &meta, KAFKA_META_TIMEOUT);
+	consumer.topic = rd_kafka_topic_new(consumer.kafka, consumer.topic_name, topic_conf);
+	err = rd_kafka_metadata(consumer.kafka, false, consumer.topic, &meta, KAFKA_META_TIMEOUT);
 
 	if (err != RD_KAFKA_RESP_ERR_NO_ERROR)
 		elog(ERROR, CONSUMER_LOG_PREFIX "failed to acquire metadata: %s",
@@ -1208,6 +1318,8 @@ kafka_consume_main(Datum arg)
 
 	Assert(meta->topic_cnt == 1);
 	topic_meta = meta->topics[0];
+	consumer.num_partitions = topic_meta.partition_cnt;
+
 	load_consumer_offsets(&consumer, &topic_meta, proc->start_offset);
 	CommitTransactionCommand();
 
@@ -1217,20 +1329,43 @@ kafka_consume_main(Datum arg)
 	for (i = 0; i < topic_meta.partition_cnt; i++)
 	{
 		int partition = topic_meta.partitions[i].id;
+		int64_t start_offset;
+		int64_t log_start_offset;
 
 		Assert(partition <= consumer.num_partitions);
 		if (partition % consumer.parallelism != proc->partition_group)
 			continue;
 
-		elog(LOG, CONSUMER_LOG_PREFIX "consuming partition %d from offset %ld",
-				CONSUMER_LOG_PREFIX_PARAMS(&consumer), partition, consumer.offsets[partition]);
+		if (consumer.group_id && proc->start_offset == RD_KAFKA_OFFSET_NULL)
+		{
+			/*
+			 * Query the offsets so we can log them here instead of logging a cryptic RD_KAFKA_OFFSET_STORED
+			 * as the start offset
+			 */
+			rd_kafka_topic_partition_list_t *topics = rd_kafka_topic_partition_list_new(1);
+			rd_kafka_topic_partition_list_add(topics, consumer.topic_name, partition);
+			rd_kafka_committed(consumer.kafka, topics, -1);
+			log_start_offset = topics->elems[0].offset;
+			start_offset = RD_KAFKA_OFFSET_STORED;
+		}
+		else
+		{
+			start_offset = log_start_offset = consumer.offsets[partition];
+		}
 
-		if (rd_kafka_consume_start(topic, partition, consumer.offsets[partition]) == -1)
+		elog(LOG, CONSUMER_LOG_PREFIX "consuming partition %d from offset %ld",
+				CONSUMER_LOG_PREFIX_PARAMS(&consumer), partition, log_start_offset);
+
+		if (rd_kafka_consume_start(consumer.topic, partition, start_offset) == -1)
 			elog(ERROR, CONSUMER_LOG_PREFIX "failed to start consuming: %s",
 					CONSUMER_LOG_PREFIX_PARAMS(&consumer), rd_kafka_err2str(rd_kafka_errno2err(errno)));
 
 		my_partitions++;
 	}
+
+	if (consumer.group_id)
+		elog(LOG, CONSUMER_LOG_PREFIX "group.id is \"%s\"",
+				CONSUMER_LOG_PREFIX_PARAMS(&consumer), consumer.group_id);
 
 	/*
 	* No point doing anything if we don't have any partitions assigned to us
@@ -1252,18 +1387,32 @@ kafka_consume_main(Datum arg)
 	MemoryContextSwitchTo(work_ctx);
 
 	if (consumer.rel)
-		consume_topic_into_relation(&consumer, proc, topic);
+		consume_topic_into_relation(&consumer, proc, consumer.topic);
 	else
-		consume_topic_stream_partitioned(&consumer, proc, topic);
+		consume_topic_stream_partitioned(&consumer, proc, consumer.topic);
 
 done:
 	hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
 
-	if (kafka)
+	for (i = 0; i < topic_meta.partition_cnt; i++)
 	{
-		if (topic)
-			rd_kafka_topic_destroy(topic);
-		rd_kafka_destroy(kafka);
+		int partition = topic_meta.partitions[i].id;
+
+		Assert(partition <= consumer.num_partitions);
+		if (partition % consumer.parallelism != proc->partition_group)
+			continue;
+
+		rd_kafka_consume_stop(consumer.topic, partition);
+		elog(LOG, CONSUMER_LOG_PREFIX "stopped consuming partition %d", CONSUMER_LOG_PREFIX_PARAMS(&consumer), partition);
+	}
+
+	if (consumer.kafka)
+	{
+		if (consumer.topic)
+			rd_kafka_topic_destroy(consumer.topic);
+
+		rd_kafka_consumer_close(consumer.kafka);
+		rd_kafka_destroy(consumer.kafka);
 		rd_kafka_wait_destroyed(KAFKA_META_TIMEOUT);
 	}
 }
@@ -1275,7 +1424,7 @@ done:
  */
 static int32
 create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
-		text *format, text *delimiter, text *quote, text *escape, int batchsize, int maxbytes,
+		text *group_id, text *format, text *delimiter, text *quote, text *escape, int batchsize, int maxbytes,
 		int parallelism, int timeout)
 {
 	HeapTuple tup;
@@ -1304,6 +1453,11 @@ create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 	values[CONSUMER_ATTR_PARALLELISM - 1] = Int32GetDatum(parallelism);
 	values[CONSUMER_ATTR_TIMEOUT - 1] = Int32GetDatum(timeout);
 	values[CONSUMER_ATTR_FORMAT - 1] = PointerGetDatum(format);
+
+	if (group_id == NULL)
+		nulls[CONSUMER_ATTR_GROUP_ID - 1] = true;
+	else
+		values[CONSUMER_ATTR_GROUP_ID - 1] = PointerGetDatum(group_id);
 
 	if (delimiter == NULL)
 		nulls[CONSUMER_ATTR_DELIMITER - 1] = true;
@@ -1437,7 +1591,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		if (running)
 		{
 			elog(WARNING, "%s is already being consumed into relation %s",
-					consumer->topic, consumer->rel ? consumer->rel->relname : "*");
+					consumer->topic_name, consumer->rel ? consumer->rel->relname : "*");
 			return true;
 		}
 
@@ -1476,7 +1630,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		sprintf(worker.bgw_library_name, PIPELINE_KAFKA_LIB);
 		sprintf(worker.bgw_function_name, KAFKA_CONSUME_MAIN);
 		snprintf(worker.bgw_name, BGW_MAXLEN, "[kafka consumer] %s <- %s",
-				consumer->rel ? consumer->rel->relname : "*", consumer->topic);
+				consumer->rel ? consumer->rel->relname : "*", consumer->topic_name);
 
 		if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 			return false;
@@ -1503,6 +1657,7 @@ kafka_consume_begin(PG_FUNCTION_ARGS)
 	ResultRelInfo *consumers;
 	Oid id;
 	bool success;
+	text *group_id;
 	text *format;
 	text *delimiter;
 	text *quote;
@@ -1520,7 +1675,7 @@ kafka_consume_begin(PG_FUNCTION_ARGS)
 		elog(ERROR, "topic cannot be null");
 	if (PG_ARGISNULL(1))
 		elog(ERROR, "relation cannot be null");
-	if (PG_ARGISNULL(2))
+	if (PG_ARGISNULL(3))
 		elog(ERROR, "format cannot be null");
 
 	/* there's no point in progressing if there aren't any brokers */
@@ -1529,17 +1684,23 @@ kafka_consume_begin(PG_FUNCTION_ARGS)
 
 	topic = PG_GETARG_TEXT_P(0);
 	qualified_name = PG_GETARG_TEXT_P(1);
-	format = PG_GETARG_TEXT_P(2);
 
-	if (PG_ARGISNULL(3))
-		delimiter = NULL;
+	if (PG_ARGISNULL(2))
+		group_id = NULL;
 	else
-		delimiter = PG_GETARG_TEXT_P(3);
+		group_id = PG_GETARG_TEXT_P(2);
+
+	format = PG_GETARG_TEXT_P(3);
 
 	if (PG_ARGISNULL(4))
+		delimiter = NULL;
+	else
+		delimiter = PG_GETARG_TEXT_P(4);
+
+	if (PG_ARGISNULL(5))
 		quote = NULL;
 	else
-		quote = PG_GETARG_TEXT_P(4);
+		quote = PG_GETARG_TEXT_P(5);
 
 	if (pg_strcasecmp(TextDatumGetCString(format), FORMAT_JSON) == 0)
 	{
@@ -1549,35 +1710,35 @@ kafka_consume_begin(PG_FUNCTION_ARGS)
 		quote = (text *) CStringGetTextDatum(FORMAT_JSON_QUOTE);
 	}
 
-	if (PG_ARGISNULL(5))
+	if (PG_ARGISNULL(6))
 		escape = NULL;
 	else
-		escape = PG_GETARG_TEXT_P(5);
-
-	if (PG_ARGISNULL(6))
-		batchsize = 10000;
-	else
-		batchsize = PG_GETARG_INT32(6);
+		escape = PG_GETARG_TEXT_P(6);
 
 	if (PG_ARGISNULL(7))
-		maxbytes = 32000000;
+		batchsize = 10000;
 	else
-		maxbytes = PG_GETARG_INT32(7);
+		batchsize = PG_GETARG_INT32(7);
 
 	if (PG_ARGISNULL(8))
-		parallelism = 1;
+		maxbytes = 32000000;
 	else
-		parallelism = PG_GETARG_INT32(8);
+		maxbytes = PG_GETARG_INT32(8);
 
 	if (PG_ARGISNULL(9))
-		timeout = 250;
+		parallelism = 1;
 	else
-		timeout = PG_GETARG_INT32(9);
+		parallelism = PG_GETARG_INT32(9);
 
 	if (PG_ARGISNULL(10))
+		timeout = 250;
+	else
+		timeout = PG_GETARG_INT32(10);
+
+	if (PG_ARGISNULL(11))
 		offset = RD_KAFKA_OFFSET_NULL;
 	else
-		offset = PG_GETARG_INT64(10);
+		offset = PG_GETARG_INT64(11);
 
 	/* verify that the target relation actually exists */
 	relname = makeRangeVarFromNameList(textToQualifiedNameList(qualified_name));
@@ -1585,7 +1746,7 @@ kafka_consume_begin(PG_FUNCTION_ARGS)
 	heap_close(rel, NoLock);
 
 	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
-	id = create_or_update_consumer(consumers, qualified_name, topic, format,
+	id = create_or_update_consumer(consumers, qualified_name, topic, group_id, format,
 			delimiter, quote, escape, batchsize, maxbytes, parallelism, timeout);
 	load_consumer_state(id, &consumer);
 	success = launch_consumer_group(&consumer, offset);
@@ -2014,6 +2175,7 @@ kafka_consume_begin_stream_partitioned(PG_FUNCTION_ARGS)
 	ResultRelInfo *consumers;
 	Oid id;
 	bool success;
+	text *group_id;
 	text *format;
 	text *delimiter;
 	text *quote;
@@ -2029,7 +2191,7 @@ kafka_consume_begin_stream_partitioned(PG_FUNCTION_ARGS)
 
 	if (PG_ARGISNULL(0))
 		elog(ERROR, "topic cannot be null");
-	if (PG_ARGISNULL(1))
+	if (PG_ARGISNULL(2))
 		elog(ERROR, "format cannot be null");
 
 	/* there's no point in progressing if there aren't any brokers */
@@ -2037,17 +2199,23 @@ kafka_consume_begin_stream_partitioned(PG_FUNCTION_ARGS)
 		elog(ERROR, "add at least one broker with pipeline_kafka.add_broker");
 
 	topic = PG_GETARG_TEXT_P(0);
-	format = PG_GETARG_TEXT_P(1);
 
-	if (PG_ARGISNULL(2))
-		delimiter = NULL;
+	if (PG_ARGISNULL(1))
+		group_id = NULL;
 	else
-		delimiter = PG_GETARG_TEXT_P(2);
+		group_id = PG_GETARG_TEXT_P(1);
+
+	format = PG_GETARG_TEXT_P(2);
 
 	if (PG_ARGISNULL(3))
+		delimiter = NULL;
+	else
+		delimiter = PG_GETARG_TEXT_P(3);
+
+	if (PG_ARGISNULL(4))
 		quote = NULL;
 	else
-		quote = PG_GETARG_TEXT_P(3);
+		quote = PG_GETARG_TEXT_P(4);
 
 	if (pg_strcasecmp(TextDatumGetCString(format), FORMAT_JSON) == 0)
 	{
@@ -2057,38 +2225,38 @@ kafka_consume_begin_stream_partitioned(PG_FUNCTION_ARGS)
 		quote = (text *) CStringGetTextDatum(FORMAT_JSON_QUOTE);
 	}
 
-	if (PG_ARGISNULL(4))
+	if (PG_ARGISNULL(5))
 		escape = NULL;
 	else
-		escape = PG_GETARG_TEXT_P(4);
-
-	if (PG_ARGISNULL(5))
-		batchsize = 10000;
-	else
-		batchsize = PG_GETARG_INT32(5);
+		escape = PG_GETARG_TEXT_P(5);
 
 	if (PG_ARGISNULL(6))
-		maxbytes = 32000000;
+		batchsize = 10000;
 	else
-		maxbytes = PG_GETARG_INT32(6);
+		batchsize = PG_GETARG_INT32(6);
 
 	if (PG_ARGISNULL(7))
-		parallelism = 1;
+		maxbytes = 32000000;
 	else
-		parallelism = PG_GETARG_INT32(7);
+		maxbytes = PG_GETARG_INT32(7);
 
 	if (PG_ARGISNULL(8))
-		timeout = 250;
+		parallelism = 1;
 	else
-		timeout = PG_GETARG_INT32(8);
+		parallelism = PG_GETARG_INT32(8);
 
 	if (PG_ARGISNULL(9))
+		timeout = 250;
+	else
+		timeout = PG_GETARG_INT32(9);
+
+	if (PG_ARGISNULL(10))
 		offset = RD_KAFKA_OFFSET_NULL;
 	else
-		offset = PG_GETARG_INT64(9);
+		offset = PG_GETARG_INT64(10);
 
 	consumers = relinfo_open(get_rangevar(CONSUMER_RELATION), ExclusiveLock);
-	id = create_or_update_consumer(consumers, NULL, topic, format,
+	id = create_or_update_consumer(consumers, NULL, topic, group_id, format,
 			delimiter, quote, escape, batchsize, maxbytes, parallelism, timeout);
 	load_consumer_state(id, &consumer);
 	success = launch_consumer_group(&consumer, offset);

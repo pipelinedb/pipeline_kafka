@@ -6,6 +6,7 @@ CREATE TABLE pipeline_kafka.consumers (
   id          serial  PRIMARY KEY,
   topic       text    NOT NULL,
   relation    text    NOT NULL,
+  group_id		text,
   format      text    NOT NULL,
   delimiter   text,
   quote       text,
@@ -34,6 +35,7 @@ CREATE TABLE pipeline_kafka.brokers (
 CREATE FUNCTION pipeline_kafka.consume_begin (
   topic        text,
   relation     text,
+  group_id     text    DEFAULT NULL,
   format       text    DEFAULT 'text',
   delimiter    text    DEFAULT E'\t',
   quote        text    DEFAULT NULL,
@@ -97,6 +99,7 @@ LANGUAGE C IMMUTABLE;
 
 CREATE FUNCTION pipeline_kafka.consume_begin_stream_partitioned (
   topic        text,
+  group_id     text    DEFAULT NULL,
   format       text    DEFAULT 'text',
   delimiter    text    DEFAULT E'\t',
   quote        text    DEFAULT NULL,
