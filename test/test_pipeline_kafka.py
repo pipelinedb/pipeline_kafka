@@ -221,3 +221,10 @@ def test_consume_json(pipeline, kafka, clean_db):
       assert k.replace('v', '') == arr_el
 
   assert eventually(unpack_cv)
+
+
+def test_grouped_consumer():
+  """
+  Verify that consumers with a group.id store offsets in Kafka and consume
+  partitions correctly.
+  """
