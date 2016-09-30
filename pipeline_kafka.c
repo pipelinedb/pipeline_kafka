@@ -703,10 +703,17 @@ save_consumer_offsets(KafkaConsumer *consumer, int partition_group)
 	{
 		for (partition = 0; partition < consumer->num_partitions; partition++)
 		{
+			rd_kafka_resp_err_t err;
+
 			if (partition % consumer->parallelism != partition_group)
 				continue;
-			// error check
-			rd_kafka_offset_store(consumer->topic, partition, consumer->offsets[partition]);
+
+			err = rd_kafka_offset_store(consumer->topic, partition, consumer->offsets[partition]);
+			if (err)
+			{
+				elog(LOG, CONSUMER_LOG_PREFIX "librdkafka error: %s",
+						CONSUMER_LOG_PREFIX_PARAMS(consumer), rd_kafka_err2str(err));
+			}
 		}
 		return;
 	}
