@@ -300,3 +300,20 @@ def test_grouped_consumer(pipeline, kafka, clean_db):
   # Verify that offsets still aren't stored locally
   rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets')
   assert not rows
+
+  # Verify that we can still begin consuming from a specific offset
+  pipeline.create_cv('group2', "SELECT x FROM stream0")
+
+  pipeline.consume_end()
+  # Skip one row per partition
+  pipeline.consume_begin('topic0', 'stream0', group_id='group2', start_offset=1)
+
+  def from_offset():
+    rows = pipeline.execute('SELECT count(*) FROM group2')
+    assert rows[0][0] == 196
+
+  assert eventually(from_offset)
+
+  # Verify that offsets still aren't stored locally
+  rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets')
+  assert not rows

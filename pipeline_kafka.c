@@ -107,7 +107,7 @@ PG_MODULE_MAGIC;
 
 #define CONSUMER_LOG_PREFIX "[pipeline_kafka] %s <- %s (PID %d): "
 #define CONSUMER_LOG_PREFIX_PARAMS(consumer) \
-	((consumer)->rel ? (consumer)->rel->relname : "*"), (consumer)->topic, MyProcPid
+	((consumer)->rel ? (consumer)->rel->relname : "*"), (consumer)->topic_name, MyProcPid
 #define CONSUMER_WORKER_RESTART_TIME 1
 
 static volatile sig_atomic_t got_SIGTERM = false;
@@ -223,7 +223,7 @@ typedef struct KafkaConsumer
 {
 	int32 id;
 	List *brokers;
-	char *topic;
+	char *topic_name;
 	RangeVar *rel;
 	int32_t partition;
 	int64_t offset;
@@ -239,6 +239,7 @@ typedef struct KafkaConsumer
 	int num_partitions;
 	int64_t *offsets;
 	rd_kafka_t *kafka;
+	rd_kafka_topic_t *topic;
 } KafkaConsumer;
 
 /* Shared-memory hashtable for storing consumer process group information */
@@ -475,6 +476,10 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
 	consumer->offsets = palloc0(meta->partition_cnt * sizeof(int64_t));
 	MemoryContextSwitchTo(old);
 
+	/* by default, begin consuming from the end of a stream */
+	for (i = 0; i < meta->partition_cnt; i++)
+		consumer->offsets[i] = start_offset;
+
 	/*
 	 * Consumers with a group get their offsets from brokers
 	 */
@@ -488,10 +493,6 @@ load_consumer_offsets(KafkaConsumer *consumer, struct rd_kafka_metadata_topic *m
 	scan = index_beginscan(offsets->ri_RelationDesc, offsets->ri_IndexRelationDescs[1],
 			GetTransactionSnapshot(), 1, 0);
 	index_rescan(scan, skey, 1, NULL, 0);
-
-	/* by default, begin consuming from the end of a stream */
-	for (i = 0; i < meta->partition_cnt; i++)
-		consumer->offsets[i] = start_offset;
 
 	while ((tup = index_getnext(scan, ForwardScanDirection)) != NULL)
 	{
@@ -592,7 +593,7 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 	/* topic */
 	d = slot_getattr(slot, CONSUMER_ATTR_TOPIC, &isnull);
 	Assert(!isnull);
-	consumer->topic = TextDatumGetCString(d);
+	consumer->topic_name = TextDatumGetCString(d);
 
 	/* consumer group id */
 	d = slot_getattr(slot, CONSUMER_ATTR_GROUP_ID, &isnull);
@@ -699,7 +700,16 @@ save_consumer_offsets(KafkaConsumer *consumer, int partition_group)
 	 * Consumers with a group store offsets in brokers
 	 */
 	if (consumer->group_id)
+	{
+		for (partition = 0; partition < consumer->num_partitions; partition++)
+		{
+			if (partition % consumer->parallelism != partition_group)
+				continue;
+			// error check
+			rd_kafka_offset_store(consumer->topic, partition, consumer->offsets[partition]);
+		}
 		return;
+	}
 
 	offsets = relinfo_open(get_rangevar(OFFSETS_RELATION), RowExclusiveLock);
 	slot = MakeSingleTupleTableSlot(RelationGetDescr(offsets->ri_RelationDesc));
@@ -1155,6 +1165,48 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 }
 
 /*
+ * configure_consumer
+ */
+static void
+configure_consumer(rd_kafka_conf_t *conf, rd_kafka_topic_conf_t *topic_conf)
+{
+	List *opts;
+	ListCell *lc;
+
+	Assert(consumer_config);
+
+	if (!SplitIdentifierString(consumer_config, ',', &opts))
+		elog(ERROR, "failed to parse pipeline_kafka.consumer_config");
+
+	foreach(lc, opts)
+	{
+		List *pair;
+		char *kv = (char *) lfirst(lc);
+		char *k;
+		char *v;
+
+		if (!SplitIdentifierString(kv, '=', &pair))
+		{
+			elog(WARNING, "malformed configuration key-value pair: %s, ignoring", kv);
+			continue;
+		}
+
+		if (list_length(pair) != 2)
+		{
+			elog(WARNING, "malformed configuration key-value pair: %s, ignoring", kv);
+			continue;
+		}
+
+		k = (char *) linitial(pair);
+		v = (char *) lsecond(pair);
+
+		if (!strncmp(k, "topic.", strlen("topic.")) == 0)
+			rd_kafka_topic_conf_set(topic_conf, k, v, NULL, 0);
+		else
+			rd_kafka_conf_set(conf, k, v, NULL, 0);
+	}
+}
+/*
  * kafka_consume_main
  *
  * Main function for Kafka consumers running as background workers
@@ -1165,7 +1217,6 @@ kafka_consume_main(Datum arg)
 	char err_msg[512];
 	rd_kafka_topic_conf_t *topic_conf;
 	rd_kafka_conf_t *conf;
-	rd_kafka_topic_t *topic = NULL;
 	const struct rd_kafka_metadata *meta;
 	struct rd_kafka_metadata_topic topic_meta;
 	rd_kafka_resp_err_t err;
@@ -1218,6 +1269,7 @@ kafka_consume_main(Datum arg)
 	{
 		rd_kafka_conf_set(conf, "group.id", consumer.group_id, NULL, 0);
 		rd_kafka_conf_set(conf, "offset.store.method", "broker", NULL, 0);
+		rd_kafka_conf_set(conf, "auto.commit.enable ", "false", NULL, 0);
 		rd_kafka_topic_conf_set(topic_conf, "topic.auto.offset.reset", "latest", NULL, 0);
 	}
 
@@ -1225,41 +1277,7 @@ kafka_consume_main(Datum arg)
 	 * Override consumer configuration with anying specified by pipeline_kafka.consumer_config
 	 */
 	if (consumer_config)
-	{
-		List *opts;
-		ListCell *lc;
-
-		if (!SplitIdentifierString(consumer_config, ',', &opts))
-			elog(ERROR, "failed to parse pipeline_kafka.consumer_config");
-
-		foreach(lc, opts)
-		{
-			List *pair;
-			char *kv = (char *) lfirst(lc);
-			char *k;
-			char *v;
-
-			if (!SplitIdentifierString(kv, '=', &pair))
-			{
-				elog(WARNING, "malformed configuration key-value pair: %s, ignoring", kv);
-				continue;
-			}
-
-			if (list_length(pair) != 2)
-			{
-				elog(WARNING, "malformed configuration key-value pair: %s, ignoring", kv);
-				continue;
-			}
-
-			k = (char *) linitial(pair);
-			v = (char *) lsecond(pair);
-
-			if (!strncmp(k, "topic.", strlen("topic.")) == 0)
-				rd_kafka_topic_conf_set(topic_conf, k, v, NULL, 0);
-			else
-				rd_kafka_conf_set(conf, k, v, NULL, 0);
-		}
-	}
+		configure_consumer(conf, topic_conf);
 
 	consumer.kafka = rd_kafka_new(RD_KAFKA_CONSUMER, conf, err_msg, sizeof(err_msg));
 	rd_kafka_set_logger(consumer.kafka, consumer_logger);
@@ -1284,8 +1302,8 @@ kafka_consume_main(Datum arg)
 	/*
 	 * Set up our topic to read from
 	 */
-	topic = rd_kafka_topic_new(consumer.kafka, consumer.topic, topic_conf);
-	err = rd_kafka_metadata(consumer.kafka, false, topic, &meta, KAFKA_META_TIMEOUT);
+	consumer.topic = rd_kafka_topic_new(consumer.kafka, consumer.topic_name, topic_conf);
+	err = rd_kafka_metadata(consumer.kafka, false, consumer.topic, &meta, KAFKA_META_TIMEOUT);
 
 	if (err != RD_KAFKA_RESP_ERR_NO_ERROR)
 		elog(ERROR, CONSUMER_LOG_PREFIX "failed to acquire metadata: %s",
@@ -1311,14 +1329,14 @@ kafka_consume_main(Datum arg)
 		if (partition % consumer.parallelism != proc->partition_group)
 			continue;
 
-		if (consumer.group_id)
+		if (consumer.group_id && proc->start_offset == RD_KAFKA_OFFSET_NULL)
 		{
 			/*
 			 * Query the offsets so we can log them here instead of logging a cryptic RD_KAFKA_OFFSET_STORED
 			 * as the start offset
 			 */
 			rd_kafka_topic_partition_list_t *topics = rd_kafka_topic_partition_list_new(1);
-			rd_kafka_topic_partition_list_add(topics, consumer.topic, partition);
+			rd_kafka_topic_partition_list_add(topics, consumer.topic_name, partition);
 			rd_kafka_committed(consumer.kafka, topics, -1);
 			log_start_offset = topics->elems[0].offset;
 			start_offset = RD_KAFKA_OFFSET_STORED;
@@ -1331,7 +1349,7 @@ kafka_consume_main(Datum arg)
 		elog(LOG, CONSUMER_LOG_PREFIX "consuming partition %d from offset %ld",
 				CONSUMER_LOG_PREFIX_PARAMS(&consumer), partition, log_start_offset);
 
-		if (rd_kafka_consume_start(topic, partition, start_offset) == -1)
+		if (rd_kafka_consume_start(consumer.topic, partition, start_offset) == -1)
 			elog(ERROR, CONSUMER_LOG_PREFIX "failed to start consuming: %s",
 					CONSUMER_LOG_PREFIX_PARAMS(&consumer), rd_kafka_err2str(rd_kafka_errno2err(errno)));
 
@@ -1362,9 +1380,9 @@ kafka_consume_main(Datum arg)
 	MemoryContextSwitchTo(work_ctx);
 
 	if (consumer.rel)
-		consume_topic_into_relation(&consumer, proc, topic);
+		consume_topic_into_relation(&consumer, proc, consumer.topic);
 	else
-		consume_topic_stream_partitioned(&consumer, proc, topic);
+		consume_topic_stream_partitioned(&consumer, proc, consumer.topic);
 
 done:
 	hash_search(consumer_procs, &id, HASH_REMOVE, NULL);
@@ -1377,14 +1395,14 @@ done:
 		if (partition % consumer.parallelism != proc->partition_group)
 			continue;
 
-		rd_kafka_consume_stop(topic, partition);
+		rd_kafka_consume_stop(consumer.topic, partition);
 		elog(LOG, CONSUMER_LOG_PREFIX "stopped consuming partition %d", CONSUMER_LOG_PREFIX_PARAMS(&consumer), partition);
 	}
 
 	if (consumer.kafka)
 	{
-		if (topic)
-			rd_kafka_topic_destroy(topic);
+		if (consumer.topic)
+			rd_kafka_topic_destroy(consumer.topic);
 
 		rd_kafka_consumer_close(consumer.kafka);
 		rd_kafka_destroy(consumer.kafka);
@@ -1566,7 +1584,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		if (running)
 		{
 			elog(WARNING, "%s is already being consumed into relation %s",
-					consumer->topic, consumer->rel ? consumer->rel->relname : "*");
+					consumer->topic_name, consumer->rel ? consumer->rel->relname : "*");
 			return true;
 		}
 
@@ -1605,7 +1623,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset)
 		sprintf(worker.bgw_library_name, PIPELINE_KAFKA_LIB);
 		sprintf(worker.bgw_function_name, KAFKA_CONSUME_MAIN);
 		snprintf(worker.bgw_name, BGW_MAXLEN, "[kafka consumer] %s <- %s",
-				consumer->rel ? consumer->rel->relname : "*", consumer->topic);
+				consumer->rel ? consumer->rel->relname : "*", consumer->topic_name);
 
 		if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 			return false;
