@@ -53,6 +53,8 @@
 
 PG_MODULE_MAGIC;
 
+#define BROKER_PATH "/brokers/ids"
+
 #define RETURN_SUCCESS() PG_RETURN_DATUM(CStringGetTextDatum("success"))
 #define RETURN_FAILURE() PG_RETURN_DATUM(CStringGetTextDatum("failure"))
 
@@ -931,6 +933,11 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 		char *librdkerrs;
 		StringInfo buf;
 
+
+		// If group,
+		// If I don't have the lock, acquire group lock
+
+
 		MemoryContextSwitchTo(work_ctx);
 		MemoryContextReset(work_ctx);
 
@@ -1213,11 +1220,7 @@ configure_consumer(rd_kafka_conf_t *conf, rd_kafka_topic_conf_t *topic_conf)
 			rd_kafka_conf_set(conf, k, v, NULL, 0);
 	}
 }
-/*
- * kafka_consume_main
- *
- * Main function for Kafka consumers running as background workers
- */
+
 void
 kafka_consume_main(Datum arg)
 {
@@ -1278,6 +1281,8 @@ kafka_consume_main(Datum arg)
 		rd_kafka_conf_set(conf, "offset.store.method", "broker", NULL, 0);
 		rd_kafka_conf_set(conf, "auto.commit.enable ", "false", NULL, 0);
 		rd_kafka_topic_conf_set(topic_conf, "topic.auto.offset.reset", "latest", NULL, 0);
+
+		// add myself to ZK with session timeout
 	}
 
 	/*

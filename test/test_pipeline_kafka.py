@@ -317,3 +317,10 @@ def test_grouped_consumer(pipeline, kafka, clean_db):
   # Verify that offsets still aren't stored locally
   rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets')
   assert not rows
+
+
+def test_grouped_consumer_failover(pipeline, kafka, clean_db):
+  """
+  Verify that if one instance of a grouped consumer is stopped or fails,
+  exactly one becomes the new active consumer.
+  """
