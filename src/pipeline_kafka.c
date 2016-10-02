@@ -50,6 +50,7 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
+#include "zookeeper.h"
 
 PG_MODULE_MAGIC;
 
@@ -933,13 +934,10 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 		char *librdkerrs;
 		StringInfo buf;
 
-
-		// If group,
-		// If I don't have the lock, acquire group lock
-
-
 		MemoryContextSwitchTo(work_ctx);
 		MemoryContextReset(work_ctx);
+
+		// verify that i still have the group lock
 
 		buf = makeStringInfo();
 
@@ -1282,7 +1280,8 @@ kafka_consume_main(Datum arg)
 		rd_kafka_conf_set(conf, "auto.commit.enable ", "false", NULL, 0);
 		rd_kafka_topic_conf_set(topic_conf, "topic.auto.offset.reset", "latest", NULL, 0);
 
-		// add myself to ZK with session timeout
+		// pull from config
+		init_zookeeper("localhost:2181", "/pipeline_kafka", consumer.group_id, 10000);
 	}
 
 	/*
@@ -1293,6 +1292,9 @@ kafka_consume_main(Datum arg)
 
 	consumer.kafka = rd_kafka_new(RD_KAFKA_CONSUMER, conf, err_msg, sizeof(err_msg));
 	rd_kafka_set_logger(consumer.kafka, consumer_logger);
+
+//	if (consumer.group_id)
+//		acquire_group_lock();
 
 	/*
 	 * Add all brokers currently in pipeline_kafka.brokers
@@ -1439,6 +1441,9 @@ create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 	ScanKeyData skey[2];
 	IndexScanDesc scan;
 	bool isnull;
+
+	if (group_id && parallelism > 1)
+		elog(ERROR, "parallelism must be 1 when using a group_id");
 
 	if (!relation)
 		relation = cstring_to_text("");

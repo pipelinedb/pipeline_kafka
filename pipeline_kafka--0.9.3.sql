@@ -15,7 +15,8 @@ CREATE TABLE pipeline_kafka.consumers (
   maxbytes    integer NOT NULL,
   parallelism integer NOT NULL,
   timeout     integer NOT NULL,
-  UNIQUE (topic, relation)
+  UNIQUE (topic, relation),
+  UNIQUE (group_id)
 );
 
 CREATE TABLE pipeline_kafka.offsets (

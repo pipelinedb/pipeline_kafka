@@ -18,7 +18,7 @@ typedef struct ZookeeperLock
 } ZooKeeperLock;
 
 extern void init_zookeeper(char *zks, char *zk_root, char *group, int session_timeout);
-extern ZooKeeperLock *acquire_lock(char *path);
+extern ZooKeeperLock *acquire_group_lock(void);
 extern bool is_lock_held(ZooKeeperLock *lock);
 extern void release_lock(ZooKeeperLock *lock);
 

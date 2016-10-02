@@ -38,33 +38,6 @@ watcher(zhandle_t *zk, int type, int state, const char *path, void *context)
 	zoo_exists(zk, path, 1, NULL);
 }
 
-/*
- * init_zookeeper
- */
-void
-init_zookeeper(char *zks, char *zk_root, char *group, int session_timeout)
-{
-  struct ACL acl[] = {{ZOO_PERM_CREATE, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_READ, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_DELETE, ZOO_ANYONE_ID_UNSAFE}};
-  struct ACL_vector acl_v = {3, acl};
-	zhandle_t *zk = zookeeper_init(zks, watcher, session_timeout, 0, 0, 0);
-	StringInfoData buf;
-
-	if (!zk)
-		elog(ERROR, "failed to establish zookeeper connection: %m");
-
-  if (zoo_create(zk, zk_root, NULL, -1, &acl_v, 0, NULL, 0) != ZOK)
-  	elog(ERROR, "failed to create root znode at \"%s\": %m", zk_root);
-
-	initStringInfo(&buf);
-	appendStringInfo(&buf, "%s/%s", zk_root, group);
-	zk_prefix = buf.data;
-
-  if (zoo_create(zk, buf.data, NULL, -1, &acl_v, 0, NULL, 0) != ZOK)
-  	elog(ERROR, "failed to create group znode at \"%s\": %m", buf.data);
-
-  pfree(buf.data);
-}
-
 static char *
 get_absolute_zpath(char *node_path)
 {
@@ -74,6 +47,36 @@ get_absolute_zpath(char *node_path)
 	appendStringInfo(&buf, "%s/%s", zk_prefix, node_path);
 
 	return buf.data;
+}
+
+/*
+ * init_zookeeper
+ */
+void
+init_zookeeper(char *zks, char *zk_root, char *group, int session_timeout)
+{
+  struct ACL acl[] = {{ZOO_PERM_CREATE, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_READ, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_DELETE, ZOO_ANYONE_ID_UNSAFE}};
+  struct ACL_vector acl_v = {3, acl};
+  StringInfoData buf;
+  int rc;
+
+	zk = zookeeper_init(zks, watcher, session_timeout, 0, 0, 0);
+	if (!zk)
+		elog(ERROR, "failed to establish zookeeper connection: %m");
+
+	rc = zoo_create(zk, zk_root, NULL, -1, &acl_v, 0, NULL, 0);
+  if (rc != ZOK && rc != ZNODEEXISTS)
+  	elog(ERROR, "failed to create root znode at \"%s\": %m", zk_root);
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "%s/%s", zk_root, group);
+	zk_prefix = pstrdup(buf.data);
+
+  rc = zoo_create(zk, buf.data, NULL, -1, &acl_v, 0, NULL, 0);
+  if (rc != ZOK && rc != ZNODEEXISTS)
+  	elog(ERROR, "failed to create group znode at \"%s\": %m", buf.data);
+
+  pfree(buf.data);
 }
 
 /*
@@ -88,7 +91,7 @@ get_absolute_zpath(char *node_path)
  * 5) If the child node from 4) does not exist, goto 2). Otherwise, wait for a delete notification on the node before going to 2).
  */
 ZooKeeperLock *
-acquire_lock(char *path)
+acquire_group_lock(void)
 {
   struct ACL acl[] = {{ZOO_PERM_CREATE, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_READ, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_DELETE, ZOO_ANYONE_ID_UNSAFE}};
   struct ACL_vector acl_v = {3, acl};
@@ -98,14 +101,16 @@ acquire_lock(char *path)
   char **nodes;
   char *next_node;
   StringInfoData created_name;
+  char *lock_path = get_absolute_zpath("consumer-");
+  MemoryContext old;
 
   initStringInfo(&created_name);
 
 	/*
 	 * 1) Create an ephemeral, sequential znode for the given path
 	 */
-  if (zoo_create(zk, get_absolute_zpath("consumer-"), NULL, -1, &acl_v, flags, created_name.data, created_name.maxlen) != ZOK)
-  	elog(ERROR, "failed to create lock node for \"%s\": %m", path);
+  if (zoo_create(zk, lock_path, NULL, -1, &acl_v, flags, created_name.data, created_name.maxlen) != ZOK)
+  	elog(ERROR, "failed to create lock node for \"%s\": %m", lock_path);
 
 acquire_lock:
 
@@ -155,12 +160,16 @@ acquire_lock:
 	if (zoo_exists(zk, next_node, 1, NULL) == ZOK)
 	{
 		wait_on = next_node;
+		elog(LOG, "waiting on \"%s\" for lock on \"%s\"", next_node, zk_prefix);
+
 		while (wait_on)
 			pg_usleep(1 * 1000 * 1000);
 	}
 	goto acquire_lock;
 
 lock_acquired:
+
+	elog(LOG, "acquired lock on \"%s\"", zk_prefix);
 
 	return NULL;
 }
@@ -169,17 +178,8 @@ lock_acquired:
  * is_lock_held
  */
 bool
-is_lock_held(ZooKeeperLock *lock)
+is_group_lock_held(ZooKeeperLock *lock)
 {
 	struct Stat stat;
 	return zoo_exists(zk, lock->path, 1, &stat) == ZOK;
-}
-
-/*
- * release_lock
- */
-void
-release_lock(ZooKeeperLock *lock)
-{
-
 }
