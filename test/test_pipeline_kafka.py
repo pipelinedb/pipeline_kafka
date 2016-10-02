@@ -1,4 +1,4 @@
-from base import kafka, pipeline, clean_db, eventually
+from base import kafka, pipeline, clean_db, eventually, PipelineDB
 import json
 import subprocess
 import threading
@@ -319,14 +319,101 @@ def test_grouped_consumer(pipeline, kafka, clean_db):
   assert not rows
 
 
-def test_grouped_consumer_failover(pipeline, kafka, clean_db):
+def test_grouped_consumer_failover(kafka):
   """
   Verify that if one instance of a grouped consumer is stopped or fails,
   exactly one becomes the new active consumer.
   """
+  kafka.create_topic('topic0')
+  kafka.create_topic('topic1')
+
+  pdb0 = PipelineDB()
+  pdb1 = PipelineDB()
+
+  pdb0.run()
+  pdb1.run()
+
+  pdb0.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
+  pdb0.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
+  pdb1.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
+  pdb1.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
+
+  pdb0.create_stream('stream0', x='integer')
+  pdb0.create_stream('stream1', x='integer')
+  pdb0.create_cv('group0', "SELECT x, COUNT(*) FROM stream0 GROUP BY x")
+  pdb0.create_cv('group1', "SELECT x, COUNT(*) FROM stream1 GROUP BY x")
+
+  pdb1.create_stream('stream0', x='integer')
+  pdb1.create_stream('stream1', x='integer')
+  pdb1.create_cv('group0', "SELECT x, COUNT(*) FROM stream0 GROUP BY x")
+  pdb1.create_cv('group1', "SELECT x, COUNT(*) FROM stream1 GROUP BY x")
+
+  pdb0.consume_begin('topic0', 'stream0', group_id='group0')
+  pdb0.consume_begin('topic1', 'stream1', group_id='group1')
+
+  # Let pdb0 take the lock
+  time.sleep(5)
+
+  pdb1.consume_begin('topic0', 'stream0', group_id='group0')
+  pdb1.consume_begin('topic1', 'stream1', group_id='group1')
+
+  producer0 = kafka.get_producer('topic0')
+  producer1 = kafka.get_producer('topic1')
+
+  for n in range(0, 100):
+    producer0.produce(str(n))
+    producer1.produce(str(n))
+
+  def counts0():
+    rows = pdb0.execute('SELECT sum(count) FROM group0')
+    assert rows[0][0] == 100
+
+    rows = pdb0.execute('SELECT sum(count) FROM group1')
+    assert rows[0][0] == 100
+
+    rows = pdb1.execute('SELECT sum(count) FROM group0')
+    assert rows[0][0] is None
+
+    rows = pdb1.execute('SELECT sum(count) FROM group1')
+    assert rows[0][0] is None
+
+  assert eventually(counts0)
+
+  # Stop one consumer so the other one takes the lock
+  pdb0.consume_end()
+  time.sleep(1)
+
+  pdb0.consume_begin('topic0', 'stream0', group_id='group0')
+  pdb0.consume_begin('topic1', 'stream1', group_id='group1')
+
+  for n in range(0, 100):
+    producer0.produce(str(n))
+    producer1.produce(str(n))
+
+  def counts1():
+    rows = pdb0.execute('SELECT sum(count) FROM group0')
+    assert rows[0][0] == 100
+
+    rows = pdb0.execute('SELECT sum(count) FROM group1')
+    assert rows[0][0] == 100
+
+    # Only this DB should have consumed messages this time
+    rows = pdb1.execute('SELECT sum(count) FROM group0')
+    assert rows[0][0] == 100
+
+    rows = pdb1.execute('SELECT sum(count) FROM group1')
+    assert rows[0][0] == 100
+
+  assert eventually(counts1)
+
+  pdb1.consume_end()
+  pdb0.consume_end()
+
+  pdb0.destroy()
+  pdb1.destroy()
 
 
-def test_grouped_consumer_session_loss(pipeline, kafka, clean_db):
+def test_grouped_consumer_session_loss(kafka):
   """
   Verify that even if a consumer group initially acquires the group lock,
   it must continuously verify that it still has the lock before actually

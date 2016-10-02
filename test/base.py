@@ -70,7 +70,8 @@ class PipelineDB(object):
       'anonymous_update_checks': 'off',
       'continuous_query_max_wait': 5,
       'shared_preload_libraries': 'pipeline_kafka',
-      'pipeline_kafka.broker_version': '0.8.2.2'
+      'pipeline_kafka.broker_version': '0.8.2.2',
+      'pipeline_kafka.zookeeper_connect': 'localhost:2181'
     }
 
     cmd = [self.server, '-D', self.data_dir, '-p', str(self.port)]

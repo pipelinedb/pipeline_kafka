@@ -1340,8 +1340,6 @@ kafka_consume_main(Datum arg)
 
 		init_zk(zookeeper_connect, zookeeper_prefix, zookeeper_session_timeout);
 		consumer.group_lock = zk_lock_new(consumer.group_id);
-		if (consumer.group_id)
-			acquire_zk_lock(consumer.group_lock);
 	}
 
 	/*
@@ -1384,6 +1382,12 @@ kafka_consume_main(Datum arg)
 	topic_meta = meta->topics[0];
 	consumer.num_partitions = topic_meta.partition_cnt;
 
+	CommitTransactionCommand();
+
+	if (consumer.group_id)
+		acquire_zk_lock(consumer.group_lock);
+
+	StartTransactionCommand();
 	load_consumer_offsets(&consumer, &topic_meta, proc->start_offset);
 	CommitTransactionCommand();
 
