@@ -54,7 +54,7 @@
 
 PG_MODULE_MAGIC;
 
-#define BROKER_PATH "/brokers/ids"
+#define DEFAULT_ZK_PREFIX "/pipeline_kafka"
 
 #define RETURN_SUCCESS() PG_RETURN_DATUM(CStringGetTextDatum("success"))
 #define RETURN_FAILURE() PG_RETURN_DATUM(CStringGetTextDatum("failure"))
@@ -118,6 +118,9 @@ static rd_kafka_t *MyKafka = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static char *broker_version = NULL;
 static char *consumer_config = NULL;
+static char *zookeeper_connect = NULL;
+static int zookeeper_session_timeout = NULL;
+static char *zookeeper_prefix = NULL;
 
 void _PG_init(void);
 
@@ -243,6 +246,7 @@ typedef struct KafkaConsumer
 	int64_t *offsets;
 	rd_kafka_t *kafka;
 	rd_kafka_topic_t *topic;
+	zk_lock_t *group_lock;
 } KafkaConsumer;
 
 /* Shared-memory hashtable for storing consumer process group information */
@@ -328,6 +332,30 @@ _PG_init(void)
 			NULL,
 			&consumer_config,
 			NULL,
+			PGC_POSTMASTER, 0,
+			NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pipeline_kafka.zookeeper_connect",
+			gettext_noop("Comma-separated list of ZooKeeper endpoints to connect to when using consumer groups."),
+			NULL,
+			&zookeeper_connect,
+			NULL,
+			PGC_POSTMASTER, 0,
+			NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pipeline_kafka.zookeeper_prefix",
+			gettext_noop("Path prefix under which to create all ZooKeeper znodes."),
+			NULL,
+			&zookeeper_prefix,
+			DEFAULT_ZK_PREFIX,
+			PGC_POSTMASTER, 0,
+			NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pipeline_kafka.zookeeper_session_timeout",
+			gettext_noop("Requested session length in milliseconds of ZooKeeper sessions."),
+			NULL,
+			&zookeeper_session_timeout,
+			10000, 1000, INT_MAX,
 			PGC_POSTMASTER, 0,
 			NULL, NULL, NULL);
 
@@ -937,7 +965,16 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 		MemoryContextSwitchTo(work_ctx);
 		MemoryContextReset(work_ctx);
 
-		// verify that i still have the group lock
+		if (consumer->group_id)
+		{
+			/*
+			 * Even if we initially acquired the consumer group lock, we need to
+			 * continuously verify that we still hold it in order to defend against
+			 * ZK session loss.
+			 */
+			if (!is_zk_lock_held(consumer->group_lock))
+				acquire_zk_lock(consumer->group_lock);
+		}
 
 		buf = makeStringInfo();
 
@@ -1280,8 +1317,13 @@ kafka_consume_main(Datum arg)
 		rd_kafka_conf_set(conf, "auto.commit.enable ", "false", NULL, 0);
 		rd_kafka_topic_conf_set(topic_conf, "topic.auto.offset.reset", "latest", NULL, 0);
 
-		// pull from config
-		init_zookeeper("localhost:2181", "/pipeline_kafka", consumer.group_id, 10000);
+		if (!zookeeper_connect)
+			elog(ERROR, "pipeline_kafka.zookeeper_connect not set");
+
+		init_zk(zookeeper_connect, zookeeper_prefix, zookeeper_session_timeout);
+		consumer.group_lock = zk_lock_new(consumer.group_id);
+		if (consumer.group_id)
+			acquire_zk_lock(consumer.group_lock);
 	}
 
 	/*
@@ -1292,9 +1334,6 @@ kafka_consume_main(Datum arg)
 
 	consumer.kafka = rd_kafka_new(RD_KAFKA_CONSUMER, conf, err_msg, sizeof(err_msg));
 	rd_kafka_set_logger(consumer.kafka, consumer_logger);
-
-//	if (consumer.group_id)
-//		acquire_group_lock();
 
 	/*
 	 * Add all brokers currently in pipeline_kafka.brokers

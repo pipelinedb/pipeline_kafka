@@ -11,11 +11,16 @@
 #include <string.h>
 
 #include "lib/stringinfo.h"
-
+#include "storage/lwlock.h"
+#include "storage/spin.h"
+#include "utils/memutils.h"
 #include "zookeeper.h"
 
-static char *wait_on = NULL;
-static char *zk_prefix = NULL;
+#define MAX_ZK_LOCKS 32
+
+static zk_lock_t *zk_locks[MAX_ZK_LOCKS];
+
+static char *zk_root = NULL;
 static zhandle_t *zk = NULL;
 
 static int
@@ -32,55 +37,107 @@ watcher(zhandle_t *zk, int type, int state, const char *path, void *context)
 {
 	if (type == ZOO_DELETED_EVENT)
 	{
-		if (wait_on && strcmp(wait_on, path) == 0)
-			wait_on = NULL;
+		int i;
+
+		for (i = 0; i < MAX_ZK_LOCKS; i++)
+		{
+			if (zk_locks[i] &&
+					zk_locks[i]->waiting_on_znode && strcmp(zk_locks[i]->waiting_on_znode, path) == 0)
+			{
+				zk_locks[i]->waiting_on_znode = NULL;
+				break;
+			}
+		}
 	}
 	zoo_exists(zk, path, 1, NULL);
 }
 
 static char *
-get_absolute_zpath(char *node_path)
+get_absolute_zpath(char *lock_name, char *node_path)
 {
 	StringInfoData buf;
 
 	initStringInfo(&buf);
-	appendStringInfo(&buf, "%s/%s", zk_prefix, node_path);
+	appendStringInfo(&buf, "%s/%s", zk_root, lock_name);
+
+	if (node_path)
+		appendStringInfo(&buf, "/%s", node_path);
 
 	return buf.data;
 }
 
 /*
- * init_zookeeper
+ * init_zk_lock
  */
 void
-init_zookeeper(char *zks, char *zk_root, char *group, int session_timeout)
+init_zk(char *zks, char *root, int session_timeout)
 {
   struct ACL acl[] = {{ZOO_PERM_CREATE, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_READ, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_DELETE, ZOO_ANYONE_ID_UNSAFE}};
   struct ACL_vector acl_v = {3, acl};
-  StringInfoData buf;
   int rc;
+  MemoryContext old;
 
 	zk = zookeeper_init(zks, watcher, session_timeout, 0, 0, 0);
 	if (!zk)
 		elog(ERROR, "failed to establish zookeeper connection: %m");
 
-	rc = zoo_create(zk, zk_root, NULL, -1, &acl_v, 0, NULL, 0);
+	rc = zoo_create(zk, root, NULL, -1, &acl_v, 0, NULL, 0);
   if (rc != ZOK && rc != ZNODEEXISTS)
-  	elog(ERROR, "failed to create root znode at \"%s\": %m", zk_root);
+  	elog(ERROR, "failed to create root znode at \"%s\": %m", root);
+
+
+  old = MemoryContextSwitchTo(CacheMemoryContext);
+  zk_root = pstrdup(root);
+  MemSet(zk_locks, 0, sizeof(zk_locks));
+	MemoryContextSwitchTo(old);
+}
+
+zk_lock_t *
+zk_lock_new(char *name)
+{
+  struct ACL acl[] = {{ZOO_PERM_CREATE, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_READ, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_DELETE, ZOO_ANYONE_ID_UNSAFE}};
+  struct ACL_vector acl_v = {3, acl};
+  StringInfoData buf;
+  int rc;
+  int i;
+  int lock_index = -1;
+  MemoryContext old;
+
+  if (!zk_root)
+  	elog(ERROR, "zookeeper has not been initialized");
+
+  for (i = 0; i < MAX_ZK_LOCKS; i++)
+  {
+  	if (zk_locks[i] == NULL)
+  	{
+  		lock_index = i;
+  		break;
+  	}
+  }
+
+  if (lock_index < 0)
+  	elog(ERROR, "all %d zk locks have been allocated", MAX_ZK_LOCKS);
 
 	initStringInfo(&buf);
-	appendStringInfo(&buf, "%s/%s", zk_root, group);
-	zk_prefix = pstrdup(buf.data);
+	appendStringInfo(&buf, "%s/%s", zk_root, name);
 
   rc = zoo_create(zk, buf.data, NULL, -1, &acl_v, 0, NULL, 0);
   if (rc != ZOK && rc != ZNODEEXISTS)
   	elog(ERROR, "failed to create group znode at \"%s\": %m", buf.data);
 
+  old = MemoryContextSwitchTo(CacheMemoryContext);
+  zk_locks[lock_index] = palloc0(sizeof(zk_lock_t));
+  zk_locks[lock_index]->lock_znode = NULL;
+  zk_locks[lock_index]->name = pstrdup(name);
+  MemoryContextSwitchTo(old);
+
   pfree(buf.data);
+
+  return zk_locks[lock_index];
 }
 
 /*
- * acquire_lock
+ * acquire_zk_lock
  *
  * Based on the "Locks" recipe in the ZK docs: https://zookeeper.apache.org/doc/trunk/recipes.html:
  *
@@ -90,8 +147,8 @@ init_zookeeper(char *zks, char *zk_root, char *group, int session_timeout)
  * 4) Add a watch to the child node in front if me, as determined by its sequence number.
  * 5) If the child node from 4) does not exist, goto 2). Otherwise, wait for a delete notification on the node before going to 2).
  */
-ZooKeeperLock *
-acquire_group_lock(void)
+void
+acquire_zk_lock(zk_lock_t *lock)
 {
   struct ACL acl[] = {{ZOO_PERM_CREATE, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_READ, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_DELETE, ZOO_ANYONE_ID_UNSAFE}};
   struct ACL_vector acl_v = {3, acl};
@@ -99,10 +156,17 @@ acquire_group_lock(void)
 	int i;
   struct String_vector children;
   char **nodes;
-  char *next_node;
   StringInfoData created_name;
-  char *lock_path = get_absolute_zpath("consumer-");
+  char *lock_path;
+  char *lock_prefix;
+  char *wait_on;
   MemoryContext old;
+
+  if (!zk_root)
+  	elog(ERROR, "zookeeper has not been initialized");
+
+  lock_path = get_absolute_zpath(lock->name, "lock-");
+  lock_prefix = get_absolute_zpath(lock->name, NULL);
 
   initStringInfo(&created_name);
 
@@ -117,8 +181,8 @@ acquire_lock:
 	/*
 	 * 2) Get all lock waiters
 	 */
-	if (zoo_get_children(zk, zk_prefix, 0, &children) != ZOK)
-		elog(ERROR, "failed to get children of \"%s\": %m", zk_prefix);
+	if (zoo_get_children(zk, lock_prefix, 0, &children) != ZOK)
+		elog(ERROR, "failed to get children of \"%s\": %m", lock_path);
 
 	if (children.count == 1)
 	{
@@ -137,7 +201,7 @@ acquire_lock:
 	/*
 	 * 3) If I'm the first node in the lock queue, I now have the lock
 	 */
-	if (strcmp(created_name.data + strlen(zk_prefix) + 1, nodes[0]) == 0)
+	if (strcmp(created_name.data + strlen(lock_prefix) + 1, nodes[0]) == 0)
 		goto lock_acquired;
 
 	/*
@@ -145,41 +209,51 @@ acquire_lock:
 	 */
 	for (i = 1; i < children.count; i++)
 	{
-		if (strcmp(created_name.data + strlen(zk_prefix) + 1, nodes[i]) == 0)
+		if (strcmp(created_name.data + strlen(lock_prefix) + 1, nodes[i]) == 0)
 		{
 			wait_on = nodes[i - 1];
 			break;
 		}
 	}
 
-	next_node = get_absolute_zpath(wait_on);
+	lock->waiting_on_znode = get_absolute_zpath(lock->name, wait_on);
 
 	/*
 	 * 5) If the child node from 4) does not exist, goto 2). Otherwise, wait for a delete notification on the node before going to 2).
 	 */
-	if (zoo_exists(zk, next_node, 1, NULL) == ZOK)
+	if (zoo_exists(zk, lock->waiting_on_znode, 1, NULL) == ZOK)
 	{
-		wait_on = next_node;
-		elog(LOG, "waiting on \"%s\" for lock on \"%s\"", next_node, zk_prefix);
+		wait_on = lock->waiting_on_znode;
+		elog(LOG, "waiting on \"%s\" for lock on \"%s\"", lock->waiting_on_znode, lock_prefix);
 
-		while (wait_on)
+		for (;;)
+		{
+			if (lock->waiting_on_znode == NULL)
+				break;
 			pg_usleep(1 * 1000 * 1000);
+		}
 	}
 	goto acquire_lock;
 
 lock_acquired:
 
-	elog(LOG, "acquired lock on \"%s\"", zk_prefix);
+	old = MemoryContextSwitchTo(CacheMemoryContext);
+	lock->lock_znode = pstrdup(created_name.data);
+	MemoryContextSwitchTo(old);
 
-	return NULL;
+	pfree(lock_path);
+	pfree(lock_prefix);
+	pfree(created_name.data);
+
+	elog(LOG, "acquired lock on \"%s\"", lock->lock_znode);
 }
 
 /*
- * is_lock_held
+ * is_zk_lock_held
  */
 bool
-is_group_lock_held(ZooKeeperLock *lock)
+is_zk_lock_held(zk_lock_t *lock)
 {
 	struct Stat stat;
-	return zoo_exists(zk, lock->path, 1, &stat) == ZOK;
+	return zoo_exists(zk, lock->lock_znode, 1, &stat) == ZOK;
 }

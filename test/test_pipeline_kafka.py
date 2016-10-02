@@ -324,3 +324,11 @@ def test_grouped_consumer_failover(pipeline, kafka, clean_db):
   Verify that if one instance of a grouped consumer is stopped or fails,
   exactly one becomes the new active consumer.
   """
+
+
+def test_grouped_consumer_session_loss(pipeline, kafka, clean_db):
+  """
+  Verify that even if a consumer group initially acquires the group lock,
+  it must continuously verify that it still has the lock before actually
+  consuming messages.
+  """
