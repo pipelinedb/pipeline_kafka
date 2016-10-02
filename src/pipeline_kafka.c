@@ -943,6 +943,7 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 	CopyStmt *copy;
 	rd_kafka_message_t **messages;
 	MemoryContext work_ctx = CurrentMemoryContext;
+	TimestampTz last_lock_check = 0;
 
 	StartTransactionCommand();
 	copy = get_copy_statement(consumer);
@@ -965,7 +966,7 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 		MemoryContextSwitchTo(work_ctx);
 		MemoryContextReset(work_ctx);
 
-		if (consumer->group_id)
+		if (TimestampDifferenceExceeds(last_lock_check, GetCurrentTimestamp(), zookeeper_session_timeout))
 		{
 			/*
 			 * Even if we initially acquired the consumer group lock, we need to
@@ -974,6 +975,7 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 			 */
 			if (!is_zk_lock_held(consumer->group_lock))
 				acquire_zk_lock(consumer->group_lock);
+			last_lock_check = GetCurrentTimestamp();
 		}
 
 		buf = makeStringInfo();
@@ -1086,6 +1088,7 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 	MemoryContext work_ctx = CurrentMemoryContext;
 	HASHCTL ctl;
 	HTAB *stream_state_hash;
+	TimestampTz last_lock_check = 0;
 
 	messages = MemoryContextAlloc(CacheMemoryContext, sizeof(rd_kafka_message_t *) * consumer->batch_size);
 
@@ -1109,6 +1112,21 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 
 		MemoryContextSwitchTo(work_ctx);
 		MemoryContextReset(work_ctx);
+
+		if (consumer->group_id)
+		{
+			if (TimestampDifferenceExceeds(last_lock_check, GetCurrentTimestamp(), zookeeper_session_timeout))
+			{
+				/*
+				 * Even if we initially acquired the consumer group lock, we need to
+				 * continuously verify that we still hold it in order to defend against
+				 * ZK session loss.
+				 */
+				if (!is_zk_lock_held(consumer->group_lock))
+					acquire_zk_lock(consumer->group_lock);
+				last_lock_check = GetCurrentTimestamp();
+			}
+		}
 
 		for (partition = 0; partition < consumer->num_partitions; partition++)
 		{
