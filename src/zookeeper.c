@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "lib/stringinfo.h"
+#include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/spin.h"
 #include "utils/memutils.h"
@@ -228,6 +229,7 @@ acquire_lock:
 
 		for (;;)
 		{
+			CHECK_FOR_INTERRUPTS();
 			if (lock->waiting_on_znode == NULL)
 				break;
 			pg_usleep(1 * 1000 * 1000);

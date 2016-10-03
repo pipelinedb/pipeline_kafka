@@ -1,4 +1,5 @@
 from base import kafka, pipeline, clean_db, eventually, PipelineDB
+from kazoo.client import KazooClient
 import json
 import subprocess
 import threading
@@ -419,3 +420,71 @@ def test_grouped_consumer_session_loss(kafka):
   it must continuously verify that it still has the lock before actually
   consuming messages.
   """
+  kafka.create_topic('topic')
+
+  pdb0 = PipelineDB()
+  pdb1 = PipelineDB()
+
+  pdb0.run()
+  pdb1.run()
+
+  pdb0.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
+  pdb0.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
+  pdb1.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
+  pdb1.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
+
+  pdb0.create_stream('stream', x='integer')
+  pdb0.create_cv('count', "SELECT x, COUNT(*) FROM stream GROUP BY x")
+
+  pdb1.create_stream('stream', x='integer')
+  pdb1.create_cv('count', "SELECT x, COUNT(*) FROM stream GROUP BY x")
+
+  pdb0.consume_begin('topic', 'stream', group_id='session')
+
+  # Let pdb0 take the lock
+  time.sleep(5)
+
+  pdb1.consume_begin('topic', 'stream', group_id='session')
+
+  producer = kafka.get_producer('topic')
+
+  for n in range(0, 100):
+    producer.produce(str(n))
+
+  def before_session_loss():
+    rows = pdb0.execute('SELECT sum(count) FROM count')
+    assert rows[0][0] == 100
+
+    rows = pdb1.execute('SELECT sum(count) FROM count')
+    assert rows[0][0] is None
+
+  assert eventually(before_session_loss)
+
+  # Delete pdb0's lock znode to simulate a session loss
+  zk = KazooClient(hosts='localhost:2181')
+  zk.start()
+  children = zk.get_children('/pipeline_kafka/session')
+  lock = sorted(children)[0]
+  zk.delete('/pipeline_kafka/session/%s' % lock)
+  zk.stop()
+
+  # pdb1 was next in line to hold the lock, so it should consume
+  # the remainder of the messages
+  for n in range(0, 100):
+    producer.produce(str(n))
+
+  def after_session_loss():
+    rows = pdb0.execute('SELECT sum(count) FROM count')
+    assert rows[0][0] == 100
+
+    rows = pdb1.execute('SELECT sum(count) FROM count')
+    assert rows[0][0] == 100
+
+  assert eventually(after_session_loss)
+
+  pdb1.consume_end()
+  pdb0.consume_end()
+  time.sleep(10)
+
+  pdb0.destroy()
+  pdb1.destroy()
