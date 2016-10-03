@@ -1,5 +1,4 @@
 MODULE_big = pipeline_kafka
-#OBJS = pipeline_kafka.o
 SOURCES = $(shell find src/ -type f -name '*.c')
 OBJS = $(patsubst %.c,%.o,$(SOURCES))
 
