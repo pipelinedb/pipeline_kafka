@@ -179,11 +179,11 @@ acquire_zk_lock(zk_lock_t *lock)
 
 acquire_lock:
 
-	/*
-	 * 2) Get all lock waiters
-	 */
-	if (zoo_get_children(zk, lock_prefix, 0, &children) != ZOK)
-		elog(ERROR, "failed to get children of \"%s\": %m", lock_path);
+  /*
+   * 2) Get all lock waiters
+   */
+  if (zoo_get_children(zk, lock_prefix, 0, &children) != ZOK)
+    elog(ERROR, "failed to get children of \"%s\": %m", lock_path);
 
 	if (children.count == 1)
 	{
