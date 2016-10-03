@@ -50,8 +50,11 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
+#include "zookeeper.h"
 
 PG_MODULE_MAGIC;
+
+#define DEFAULT_ZK_PREFIX "/pipeline_kafka"
 
 #define RETURN_SUCCESS() PG_RETURN_DATUM(CStringGetTextDatum("success"))
 #define RETURN_FAILURE() PG_RETURN_DATUM(CStringGetTextDatum("failure"))
@@ -115,6 +118,9 @@ static rd_kafka_t *MyKafka = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static char *broker_version = NULL;
 static char *consumer_config = NULL;
+static char *zookeeper_connect = NULL;
+static int zookeeper_session_timeout = NULL;
+static char *zookeeper_prefix = NULL;
 
 void _PG_init(void);
 
@@ -240,6 +246,7 @@ typedef struct KafkaConsumer
 	int64_t *offsets;
 	rd_kafka_t *kafka;
 	rd_kafka_topic_t *topic;
+	zk_lock_t *group_lock;
 } KafkaConsumer;
 
 /* Shared-memory hashtable for storing consumer process group information */
@@ -325,6 +332,30 @@ _PG_init(void)
 			NULL,
 			&consumer_config,
 			NULL,
+			PGC_POSTMASTER, 0,
+			NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pipeline_kafka.zookeeper_connect",
+			gettext_noop("Comma-separated list of ZooKeeper endpoints to connect to when using consumer groups."),
+			NULL,
+			&zookeeper_connect,
+			NULL,
+			PGC_POSTMASTER, 0,
+			NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pipeline_kafka.zookeeper_prefix",
+			gettext_noop("Path prefix under which to create all ZooKeeper znodes."),
+			NULL,
+			&zookeeper_prefix,
+			DEFAULT_ZK_PREFIX,
+			PGC_POSTMASTER, 0,
+			NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pipeline_kafka.zookeeper_session_timeout",
+			gettext_noop("Requested session length in milliseconds of ZooKeeper sessions."),
+			NULL,
+			&zookeeper_session_timeout,
+			10000, 1000, INT_MAX,
 			PGC_POSTMASTER, 0,
 			NULL, NULL, NULL);
 
@@ -912,6 +943,7 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 	CopyStmt *copy;
 	rd_kafka_message_t **messages;
 	MemoryContext work_ctx = CurrentMemoryContext;
+	TimestampTz last_lock_check = 0;
 
 	StartTransactionCommand();
 	copy = get_copy_statement(consumer);
@@ -933,6 +965,19 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 
 		MemoryContextSwitchTo(work_ctx);
 		MemoryContextReset(work_ctx);
+
+		if (consumer->group_id &&
+				TimestampDifferenceExceeds(last_lock_check, GetCurrentTimestamp(), zookeeper_session_timeout))
+		{
+			/*
+			 * Even if we initially acquired the consumer group lock, we need to
+			 * continuously verify that we still hold it in order to defend against
+			 * ZK session loss.
+			 */
+			if (!is_zk_lock_held(consumer->group_lock))
+				acquire_zk_lock(consumer->group_lock);
+			last_lock_check = GetCurrentTimestamp();
+		}
 
 		buf = makeStringInfo();
 
@@ -1044,6 +1089,7 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 	MemoryContext work_ctx = CurrentMemoryContext;
 	HASHCTL ctl;
 	HTAB *stream_state_hash;
+	TimestampTz last_lock_check = 0;
 
 	messages = MemoryContextAlloc(CacheMemoryContext, sizeof(rd_kafka_message_t *) * consumer->batch_size);
 
@@ -1067,6 +1113,19 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 
 		MemoryContextSwitchTo(work_ctx);
 		MemoryContextReset(work_ctx);
+
+		if (consumer->group_id &&
+				TimestampDifferenceExceeds(last_lock_check, GetCurrentTimestamp(), zookeeper_session_timeout))
+		{
+			/*
+			 * Even if we initially acquired the consumer group lock, we need to
+			 * continuously verify that we still hold it in order to defend against
+			 * ZK session loss.
+			 */
+			if (!is_zk_lock_held(consumer->group_lock))
+				acquire_zk_lock(consumer->group_lock);
+			last_lock_check = GetCurrentTimestamp();
+		}
 
 		for (partition = 0; partition < consumer->num_partitions; partition++)
 		{
@@ -1213,11 +1272,7 @@ configure_consumer(rd_kafka_conf_t *conf, rd_kafka_topic_conf_t *topic_conf)
 			rd_kafka_conf_set(conf, k, v, NULL, 0);
 	}
 }
-/*
- * kafka_consume_main
- *
- * Main function for Kafka consumers running as background workers
- */
+
 void
 kafka_consume_main(Datum arg)
 {
@@ -1278,6 +1333,12 @@ kafka_consume_main(Datum arg)
 		rd_kafka_conf_set(conf, "offset.store.method", "broker", NULL, 0);
 		rd_kafka_conf_set(conf, "auto.commit.enable ", "false", NULL, 0);
 		rd_kafka_topic_conf_set(topic_conf, "topic.auto.offset.reset", "latest", NULL, 0);
+
+		if (!zookeeper_connect)
+			elog(ERROR, "pipeline_kafka.zookeeper_connect not set");
+
+		init_zk(zookeeper_connect, zookeeper_prefix, zookeeper_session_timeout);
+		consumer.group_lock = zk_lock_new(consumer.group_id);
 	}
 
 	/*
@@ -1320,6 +1381,12 @@ kafka_consume_main(Datum arg)
 	topic_meta = meta->topics[0];
 	consumer.num_partitions = topic_meta.partition_cnt;
 
+	CommitTransactionCommand();
+
+	if (consumer.group_id)
+		acquire_zk_lock(consumer.group_lock);
+
+	StartTransactionCommand();
 	load_consumer_offsets(&consumer, &topic_meta, proc->start_offset);
 	CommitTransactionCommand();
 
@@ -1434,6 +1501,9 @@ create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 	ScanKeyData skey[2];
 	IndexScanDesc scan;
 	bool isnull;
+
+	if (group_id && parallelism > 1)
+		elog(ERROR, "parallelism must be 1 when using a group_id");
 
 	if (!relation)
 		relation = cstring_to_text("");
