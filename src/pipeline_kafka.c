@@ -966,7 +966,8 @@ consume_topic_into_relation(KafkaConsumer *consumer, KafkaConsumerProc *proc, rd
 		MemoryContextSwitchTo(work_ctx);
 		MemoryContextReset(work_ctx);
 
-		if (TimestampDifferenceExceeds(last_lock_check, GetCurrentTimestamp(), zookeeper_session_timeout))
+		if (consumer->group_id &&
+				TimestampDifferenceExceeds(last_lock_check, GetCurrentTimestamp(), zookeeper_session_timeout))
 		{
 			/*
 			 * Even if we initially acquired the consumer group lock, we need to
@@ -1113,19 +1114,17 @@ consume_topic_stream_partitioned(KafkaConsumer *consumer, KafkaConsumerProc *pro
 		MemoryContextSwitchTo(work_ctx);
 		MemoryContextReset(work_ctx);
 
-		if (consumer->group_id)
+		if (consumer->group_id &&
+				TimestampDifferenceExceeds(last_lock_check, GetCurrentTimestamp(), zookeeper_session_timeout))
 		{
-			if (TimestampDifferenceExceeds(last_lock_check, GetCurrentTimestamp(), zookeeper_session_timeout))
-			{
-				/*
-				 * Even if we initially acquired the consumer group lock, we need to
-				 * continuously verify that we still hold it in order to defend against
-				 * ZK session loss.
-				 */
-				if (!is_zk_lock_held(consumer->group_lock))
-					acquire_zk_lock(consumer->group_lock);
-				last_lock_check = GetCurrentTimestamp();
-			}
+			/*
+			 * Even if we initially acquired the consumer group lock, we need to
+			 * continuously verify that we still hold it in order to defend against
+			 * ZK session loss.
+			 */
+			if (!is_zk_lock_held(consumer->group_lock))
+				acquire_zk_lock(consumer->group_lock);
+			last_lock_check = GetCurrentTimestamp();
 		}
 
 		for (partition = 0; partition < consumer->num_partitions; partition++)
