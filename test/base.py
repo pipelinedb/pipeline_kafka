@@ -343,7 +343,7 @@ class PipelineDB(object):
     Stop all consumers
     """
     self.execute('SELECT pipeline_kafka.consume_end()')
-    time.sleep(1)
+    time.sleep(2)
 
   def consume_begin_stream_partitioned(self, topic, format='text', delimiter='\t',
                     quote=None, escape=None, batchsize=1000,
