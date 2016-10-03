@@ -467,6 +467,7 @@ def test_grouped_consumer_session_loss(kafka):
   lock = sorted(children)[0]
   zk.delete('/pipeline_kafka/session/%s' % lock)
   zk.stop()
+  time.sleep(20)
 
   # pdb1 was next in line to hold the lock, so it should consume
   # the remainder of the messages
