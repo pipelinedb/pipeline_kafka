@@ -257,5 +257,22 @@ bool
 is_zk_lock_held(zk_lock_t *lock)
 {
   struct Stat stat;
-  return zoo_exists(zk, lock->lock_znode, 1, &stat) == ZOK;
+  int attempts = 5;
+
+  while (attempts > 0)
+  {
+    int rc = zoo_exists(zk, lock->lock_znode, 1, &stat);
+    if (rc == ZOK)
+      return true;
+    else if (rc == ZNONODE)
+      return false;
+    else
+      pg_usleep(1 * 1000 * 1000);
+
+    attempts--;
+  }
+
+  elog(ERROR, "failed to verify lock %s is held", lock->lock_znode);
+
+  return false;
 }
