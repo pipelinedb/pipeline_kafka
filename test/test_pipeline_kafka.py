@@ -669,3 +669,27 @@ def test_null_offsets(pipeline, kafka, clean_db):
 
   rows = pipeline.execute('SELECT * FROM pipeline_kafka.offsets WHERE "offset" IS NULL')
   assert len(rows) == 3
+
+
+def test_multiple_shards(pipeline, kafka, clean_db):
+  """
+  Verify that consumers can be launched that only consume a subset of all partitions
+  """
+  kafka.create_topic('shard_topic', partitions=4)
+  pipeline.create_stream('shard_stream', x='integer')
+  pipeline.create_cv('shard0', 'SELECT count(*) FROM shard_stream')
+
+  pipeline.consume_begin('shard_topic', 'shard_stream', group_id='shards.0', shard_id=0, num_shards=4, parallelism=2)
+  pipeline.consume_begin('shard_topic', 'shard_stream', group_id='shards.1', shard_id=1, num_shards=4, parallelism=4)
+  pipeline.consume_begin('shard_topic', 'shard_stream', group_id='shards.2', shard_id=2, num_shards=4, parallelism=3)
+  pipeline.consume_begin('shard_topic', 'shard_stream', group_id='shards.3', shard_id=3, num_shards=4, parallelism=2)
+
+  producer = kafka.get_producer('shard_topic')
+  for n in range(1000):
+    producer.produce(str(n), partition_key=str(n))
+
+  def all_shards():
+    rows = pipeline.execute('SELECT count FROM shard0')
+    assert rows[0][0] == 1000
+
+  assert eventually(all_shards)

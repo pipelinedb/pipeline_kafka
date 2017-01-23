@@ -15,7 +15,9 @@ CREATE TABLE pipeline_kafka.consumers (
   maxbytes    integer NOT NULL,
   parallelism integer NOT NULL,
   timeout     integer NOT NULL,
-  UNIQUE (topic, relation),
+  shard_id    integer NOT NULL,
+  num_shards  integer NOT NULL,
+  UNIQUE (topic, relation, shard_id),
   UNIQUE (group_id)
 );
 
@@ -45,7 +47,9 @@ CREATE FUNCTION pipeline_kafka.consume_begin (
   maxbytes     integer DEFAULT 32000000, -- 32mb
   parallelism  integer DEFAULT 1,
   timeout      integer DEFAULT 250,
-  start_offset bigint  DEFAULT NULL
+  start_offset bigint  DEFAULT NULL,
+  shard_id     integer DEFAULT 0,
+  num_shards   integer DEFAULT 1
 )
 RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_consume_begin'
@@ -120,6 +124,26 @@ CREATE FUNCTION pipeline_kafka.consume_end_stream_partitioned (
 )
 RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_consume_end_stream_partitioned'
+LANGUAGE C IMMUTABLE;
+
+CREATE FUNCTION pipeline_kafka.distributed_consume_begin (
+  topic        text,
+  relation     text,
+  group_id     text    DEFAULT NULL,
+  format       text    DEFAULT 'text',
+  delimiter    text    DEFAULT E'\t',
+  quote        text    DEFAULT NULL,
+  escape       text    DEFAULT NULL,
+  batchsize    integer DEFAULT 10000,
+  maxbytes     integer DEFAULT 32000000, -- 32mb
+  parallelism  integer DEFAULT 1,
+  timeout      integer DEFAULT 250,
+  start_offset bigint  DEFAULT NULL,
+  shard_id     integer DEFAULT 0,
+  num_shards   integer DEFAULT 1
+)
+RETURNS text
+AS 'MODULE_PATHNAME', 'kafka_distributed_consume_begin'
 LANGUAGE C IMMUTABLE;
 
 CREATE FUNCTION pipeline_kafka.topic_watermarks (topic text, partition integer)
