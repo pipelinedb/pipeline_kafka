@@ -231,6 +231,7 @@ typedef struct KafkaConsumerGroup
 	int parallelism;
 	slock_t mutex;
 	TimestampTz lock_acquired;
+	bool defer_lock;
 } KafkaConsumerGroup;
 
 /*
@@ -259,6 +260,8 @@ typedef struct KafkaConsumer
 	rd_kafka_topic_t *topic;
 	zk_lock_t *group_lock;
 	TimestampTz last_lock_check;
+	int shard_id;
+	int num_shards;
 } KafkaConsumer;
 
 /* Shared-memory hashtable for storing consumer process group information */
@@ -695,6 +698,16 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 	Assert(!isnull);
 	consumer->timeout = DatumGetInt32(d);
 
+	/* shard_id */
+	d = slot_getattr(slot, CONSUMER_ATTR_SHARD_ID, &isnull);
+	Assert(!isnull);
+	consumer->shard_id = DatumGetInt32(d);
+
+	/* num_shards */
+	d = slot_getattr(slot, CONSUMER_ATTR_NUM_SHARDS, &isnull);
+	Assert(!isnull);
+	consumer->num_shards = DatumGetInt32(d);
+
 	ExecDropSingleTupleTableSlot(slot);
 	index_endscan(scan);
 	relinfo_close(consumers, NoLock);
@@ -733,7 +746,7 @@ should_consume(KafkaConsumer *consumer, KafkaConsumerProc *proc, int partition)
 	if (partition % consumer->parallelism != proc->partition_group)
 		return false;
 
-	if (partition % proc->num_shards != proc->shard_id)
+	if (partition % consumer->num_shards != consumer->shard_id)
 		return false;
 
 	return true;
@@ -1534,6 +1547,16 @@ kafka_consume_main(Datum arg)
 
 		group = (KafkaConsumerGroup *) hash_search(consumer_groups, &key, HASH_FIND, NULL);
 		Assert(group);
+
+		/*
+		 * Wait for another session to take the lock if necessary
+		 */
+		if (group->defer_lock && IS_LOCK_PROC(proc))
+		{
+			elog(LOG, "deferring lock for group \"%s\"...", consumer.group_id);
+			defer_zk_lock(consumer.group_lock);
+		}
+
 		acquire_consumer_lock(group, &consumer, proc);
 	}
 
@@ -1679,7 +1702,6 @@ create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 	values[CONSUMER_ATTR_SHARD_ID - 1] = Int32GetDatum(shard_id);
 	values[CONSUMER_ATTR_NUM_SHARDS - 1] = Int32GetDatum(num_shards);
 
-
 	if (group_id == NULL)
 		nulls[CONSUMER_ATTR_GROUP_ID - 1] = true;
 	else
@@ -1787,7 +1809,7 @@ get_consumer_id(ResultRelInfo *consumers, text *relation, text *topic)
  * into the given relation
  */
 static bool
-launch_consumer_group(KafkaConsumer *consumer, int64 offset, int shard_id, int num_shards)
+launch_consumer_group(KafkaConsumer *consumer, int64 offset, bool defer_lock)
 {
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *handle;
@@ -1825,6 +1847,7 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset, int shard_id, int n
 	}
 
 	group->parallelism = consumer->parallelism;
+	group->defer_lock = defer_lock;
 	SpinLockInit(&group->mutex);
 
 	for (i = 0; i < group->parallelism; i++)
@@ -1845,8 +1868,6 @@ launch_consumer_group(KafkaConsumer *consumer, int64 offset, int shard_id, int n
 		proc->partition_group = i;
 		proc->start_offset = offset;
 		proc->db = MyDatabaseId;
-		proc->shard_id = shard_id;
-		proc->num_shards = num_shards;
 
 		worker.bgw_main_arg = Int32GetDatum(id);
 		worker.bgw_flags = BGWORKER_BACKEND_DATABASE_CONNECTION | BGWORKER_SHMEM_ACCESS;
@@ -1898,6 +1919,7 @@ kafka_consume_begin(PG_FUNCTION_ARGS)
 	int shard_id;
 	int num_shards;
 	int64 offset;
+	bool defer_lock = false;
 	KafkaConsumer consumer;
 
 	check_pipeline_kafka_preloaded();
@@ -1973,6 +1995,7 @@ kafka_consume_begin(PG_FUNCTION_ARGS)
 
 	shard_id = PG_GETARG_INT32(12);
 	num_shards = PG_GETARG_INT32(13);
+	defer_lock = PG_GETARG_BOOL(14);
 
 	/* verify that the target relation actually exists */
 	relname = makeRangeVarFromNameList(textToQualifiedNameList(qualified_name));
@@ -1983,7 +2006,7 @@ kafka_consume_begin(PG_FUNCTION_ARGS)
 	id = create_or_update_consumer(consumers, qualified_name, topic, group_id, format,
 			delimiter, quote, escape, batchsize, maxbytes, parallelism, timeout, shard_id, num_shards);
 	load_consumer_state(id, &consumer);
-	success = launch_consumer_group(&consumer, offset, shard_id, num_shards);
+	success = launch_consumer_group(&consumer, offset, defer_lock);
 	relinfo_close(consumers, NoLock);
 
 	if (success)
@@ -2074,7 +2097,7 @@ kafka_consume_begin_all(PG_FUNCTION_ARGS)
 		Assert(!isnull);
 
 		load_consumer_state(id, &consumer);
-		if (!launch_consumer_group(&consumer, RD_KAFKA_OFFSET_END, 0, 1))
+		if (!launch_consumer_group(&consumer, RD_KAFKA_OFFSET_END, false))
 			RETURN_FAILURE();
 	}
 
@@ -2493,7 +2516,7 @@ kafka_consume_begin_stream_partitioned(PG_FUNCTION_ARGS)
 	id = create_or_update_consumer(consumers, NULL, topic, group_id, format,
 			delimiter, quote, escape, batchsize, maxbytes, parallelism, timeout, 0, 1);
 	load_consumer_state(id, &consumer);
-	success = launch_consumer_group(&consumer, offset, 0, 1);
+	success = launch_consumer_group(&consumer, offset, false);
 	relinfo_close(consumers, NoLock);
 
 	if (success)
@@ -2674,11 +2697,13 @@ kafka_distributed_consume_begin(PG_FUNCTION_ARGS)
   TimestampTz start = GetCurrentTimestamp();
   int timeout = 10 * zookeeper_session_timeout;
   StringInfoData group_id_buf;
+  bool *primary_exists;
 
 	init_zk(zookeeper_connect, zookeeper_prefix, zookeeper_session_timeout);
 
 	group_id = PG_GETARG_TEXT_P(2);
 	num_shards = PG_GETARG_INT32(13);
+	primary_exists = palloc0(num_shards * sizeof(bool));
 
 	/*
 	 * Examine znodes to figure out which shard we should be the primary consumer for.
@@ -2710,45 +2735,68 @@ kafka_distributed_consume_begin(PG_FUNCTION_ARGS)
 
 	initStringInfo(&group_id_buf);
 
-	if (primary_shard >= 0)
+	/*
+	 * Now wait a reasonable amount of time for other primary consumers to start
+	 * before blowing away our ZK session data.
+	 */
+	while (!TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout))
 	{
-		/*
-		 * Launch primary consumer
-		 */
-		appendStringInfo(&group_id_buf, "%s.%d", TextDatumGetCString(group_id), primary_shard);
+		int count = 0;
+
+		MemSet(primary_exists, false, sizeof(bool) * num_shards);
+
+		for (i = 0; i < num_shards; i++)
+		{
+			resetStringInfo(&group_id_buf);
+			appendStringInfo(&group_id_buf, "%s.id.%d", TextDatumGetCString(group_id), i);
+
+			if (zk_exists(group_id_buf.data))
+			{
+				primary_exists[i] = true;
+				count++;
+			}
+		}
+
+		if (count == num_shards)
+			break;
+
+		pg_usleep(1 * 1000 * 100);
+	}
+
+	/*
+	 * Finally, launch the actual consumers
+	 */
+	for (i = 0; i < num_shards; i++)
+	{
+		bool defer_lock = true;
+
+		if (primary_shard == i)
+			defer_lock = false;
+		else if (!primary_exists[i])
+			defer_lock = false;
+
+		resetStringInfo(&group_id_buf);
+		appendStringInfo(&group_id_buf, "%s.%d", TextDatumGetCString(group_id), i);
 
 		/* group_id */
 		fcinfo->arg[2] = CStringGetTextDatum(group_id_buf.data);
 
 		/* shard_id */
-		fcinfo->arg[12] = Int32GetDatum(primary_shard);
+		fcinfo->arg[12] = Int32GetDatum(i);
 
 		/* num_shards */
 		fcinfo->arg[13] = Int32GetDatum(num_shards);
 
+		/* defer_lock */
+		fcinfo->arg[14] = BoolGetDatum(defer_lock);
+
 		fcinfo->argnull[2] = false;
 		fcinfo->argnull[12] = false;
 		fcinfo->argnull[13] = false;
+		fcinfo->argnull[14] = false;
 
 		kafka_consume_begin(fcinfo);
-		CommitTransactionCommand();
-		StartTransactionCommand();
-	}
-	else
-	{
-		elog(WARNING, "no primary shard could be determined");
 	}
 
-	/*
-	 * Now launch redundant consumers with a hint to not aggressively acquire
-	 * consumer lock, since we want to spread active consumers across as many
-	 * nodes as possible
-	 */
-	for (i = 0; i < num_shards; i++)
-	{
-
-	}
-
-	zk_close();
 	PG_RETURN_NULL();
 }

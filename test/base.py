@@ -314,7 +314,7 @@ class PipelineDB(object):
   def consume_begin(self, topic, stream, format='text', delimiter='\t',
                     quote=None, escape=None, batchsize=1000,
                     maxbytes=32000000, parallelism=1, start_offset=None,
-                    group_id=None, shard_id=0, num_shards=1):
+                    group_id=None, shard_id=0, num_shards=1, defer_lock=False):
     """
     Begin consuming with the given parameters
     """
@@ -329,7 +329,8 @@ class PipelineDB(object):
       'start_offset': start_offset,
       'group_id': group_id,
       'shard_id': shard_id,
-      'num_shards': num_shards
+      'num_shards': num_shards,
+      'defer_lock': defer_lock
     }
     args = [repr(topic), repr(stream)]
     args.extend(['%s := %s' % (k, v and repr(v).replace("'\\", "E'\\") or 'NULL') for k, v in params.items()])

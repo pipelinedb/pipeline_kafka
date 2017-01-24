@@ -159,6 +159,29 @@ zk_create(char *path)
   return (rc == ZOK);
 }
 
+bool
+zk_exists(char *path)
+{
+  int rc;
+  StringInfoData buf;
+
+  if (!zk_root)
+    elog(ERROR, "zookeeper has not been initialized");
+
+  initStringInfo(&buf);
+  appendStringInfo(&buf, "%s/%s", zk_root, path);
+
+  rc = zoo_exists(zk, buf.data, 0, NULL);
+  if (rc == ZOK)
+    return true;
+  else if (rc == ZNONODE)
+    return false;
+  else
+    elog(ERROR, "failed to check znode at \"%s\": %m", buf.data);
+
+  return false;
+}
+
 /*
  * acquire_zk_lock
  *
@@ -270,6 +293,39 @@ lock_acquired:
   pfree(created_name.data);
 
   elog(LOG, "acquired lock on \"%s\"", lock->lock_znode);
+}
+
+/*
+ * defer_zk_lock
+ *
+ * Block until the given lock is held by another session
+ */
+void
+defer_zk_lock(zk_lock_t *lock)
+{
+  struct String_vector children;
+  char *lock_path;
+  char *lock_prefix;
+
+  if (!zk_root)
+    elog(ERROR, "zookeeper has not been initialized");
+
+  lock_path = get_absolute_zpath(lock->name, "lock-");
+  lock_prefix = get_absolute_zpath(lock->name, NULL);
+
+  /*
+   * Get all lock waiters
+   */
+  for (;;)
+  {
+		if (zoo_get_children(zk, lock_prefix, 0, &children) != ZOK)
+			elog(ERROR, "failed to get children of \"%s\": %m", lock_path);
+
+		if (children.count > 0)
+			break;
+
+		pg_usleep(1 * 1000 * 1000);
+  }
 }
 
 /*

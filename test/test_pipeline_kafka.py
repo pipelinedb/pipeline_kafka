@@ -693,3 +693,42 @@ def test_multiple_shards(pipeline, kafka, clean_db):
     assert rows[0][0] == 1000
 
   assert eventually(all_shards)
+
+
+def test_defer_lock(kafka):
+  """
+  Verify that we can specify a hint to grouped consume_begin that causes it to wait for
+  another consumer to acquire the lock, thereby serving as a backup
+  """
+  kafka.create_topic('defer_lock', partitions=4)
+
+  pdb0 = PipelineDB()
+  pdb1 = PipelineDB()
+
+  for pdb in (pdb0, pdb1):
+    pdb.run()
+    pdb.execute("SELECT pipeline_kafka.add_broker('localhost:9092')")
+    pdb.execute("SELECT pipeline_kafka.add_broker('localhost:8092')")
+    pdb.create_stream('stream0', x='integer')
+    pdb.create_cv('cv0', "SELECT x, COUNT(*) FROM stream0 GROUP BY x")
+
+  # This should not acquire the lock
+  pdb0.consume_begin('defer_lock', 'stream0', group_id='group0', parallelism=4, defer_lock=True)
+  time.sleep(2)
+
+  # This consumer should acquire the lock
+  pdb1.consume_begin('defer_lock', 'stream0', group_id='group0', parallelism=4)
+  time.sleep(4)
+
+  producer = kafka.get_producer('defer_lock')
+  for n in range(0, 1000):
+    producer.produce(str(n), partition_key=str(n))
+
+  def counts():
+    rows = pdb0.execute('SELECT sum(count) FROM cv0')
+    assert rows[0][0] is None
+
+    rows = pdb1.execute('SELECT sum(count) FROM cv0')
+    assert rows[0][0] == 1000
+
+  assert eventually(counts)

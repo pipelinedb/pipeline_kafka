@@ -49,7 +49,8 @@ CREATE FUNCTION pipeline_kafka.consume_begin (
   timeout      integer DEFAULT 250,
   start_offset bigint  DEFAULT NULL,
   shard_id     integer DEFAULT 0,
-  num_shards   integer DEFAULT 1
+  num_shards   integer DEFAULT 1,
+  defer_lock   boolean DEFAULT false
 )
 RETURNS text
 AS 'MODULE_PATHNAME', 'kafka_consume_begin'
