@@ -86,7 +86,6 @@ init_zk(char *zks, char *root, int session_timeout)
   if (rc != ZOK && rc != ZNODEEXISTS)
     elog(ERROR, "failed to create root znode at \"%s\": %m", root);
 
-
   old = MemoryContextSwitchTo(CacheMemoryContext);
   zk_root = pstrdup(root);
   MemSet(zk_locks, 0, sizeof(zk_locks));
@@ -135,6 +134,29 @@ zk_lock_new(char *name)
   pfree(buf.data);
 
   return zk_locks[lock_index];
+}
+
+bool
+zk_create(char *path)
+{
+  struct ACL acl[] = {{ZOO_PERM_CREATE, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_READ, ZOO_ANYONE_ID_UNSAFE}, {ZOO_PERM_DELETE, ZOO_ANYONE_ID_UNSAFE}};
+  struct ACL_vector acl_v = {3, acl};
+  int flags = ZOO_EPHEMERAL;
+  int rc;
+  StringInfoData buf;
+
+  if (!zk_root)
+    elog(ERROR, "zookeeper has not been initialized");
+
+  initStringInfo(&buf);
+  appendStringInfo(&buf, "%s/%s", zk_root, path);
+
+  rc = zoo_create(zk, buf.data, NULL, -1, &acl_v, flags, NULL, 0);
+
+  if (rc != ZOK && rc != ZNODEEXISTS)
+    elog(ERROR, "failed to create znode at \"%s\": %m", buf.data);
+
+  return (rc == ZOK);
 }
 
 /*

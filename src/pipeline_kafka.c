@@ -1551,7 +1551,8 @@ kafka_consume_main(Datum arg)
 		int64_t log_start_offset;
 
 		Assert(partition <= consumer.num_partitions);
-		if (partition % consumer.parallelism != proc->partition_group)
+
+		if (!should_consume(&consumer, proc, partition))
 			continue;
 
 		if (consumer.group_id && proc->start_offset == RD_KAFKA_OFFSET_NULL)
@@ -1617,7 +1618,7 @@ done:
 		int partition = topic_meta.partitions[i].id;
 
 		Assert(partition <= consumer.num_partitions);
-		if (partition % consumer.parallelism != proc->partition_group)
+		if (!should_consume(&consumer, proc, partition))
 			continue;
 
 		rd_kafka_consume_stop(consumer.topic, partition);
@@ -2665,15 +2666,89 @@ PG_FUNCTION_INFO_V1(kafka_distributed_consume_begin);
 Datum
 kafka_distributed_consume_begin(PG_FUNCTION_ARGS)
 {
-	// for node_id in range(num_nodes)
-		// create /pipeline_kafka/<group_id>/ids/n
-			// if created, that's my id
-			// else, keep trying
-			// continuous session checks don't really matter since this is only for startup
+	int num_shards;
+	int i;
+  StringInfoData buf;
+  text *group_id;
+  int primary_shard = -1;
+  TimestampTz start = GetCurrentTimestamp();
+  int timeout = 10 * zookeeper_session_timeout;
+  StringInfoData group_id_buf;
 
-	// start my consumer,
+	init_zk(zookeeper_connect, zookeeper_prefix, zookeeper_session_timeout);
 
-	// wait 2 * zk_session_timeout for others to start
+	group_id = PG_GETARG_TEXT_P(2);
+	num_shards = PG_GETARG_INT32(13);
 
+	/*
+	 * Examine znodes to figure out which shard we should be the primary consumer for.
+	 *
+	 * This only really matters at startup, as we wait for other nodes to take the consumer
+	 * lock for shards that we're not the primary for, thereby spreading the consumer load
+	 * across as many nodes as possible.
+	 */
+	while (!TimestampDifferenceExceeds(start, GetCurrentTimestamp(), timeout))
+	{
+		for (i = 0; i < num_shards; i++)
+		{
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "%s.id.%d", TextDatumGetCString(group_id), i);
+
+			if (zk_create(buf.data))
+			{
+				primary_shard = i;
+				elog(LOG, "my primary shard is %d", primary_shard);
+				break;
+			}
+		}
+
+		if (primary_shard >= 0)
+			break;
+
+		pg_usleep(1 * 1000 * 1000);
+	}
+
+	initStringInfo(&group_id_buf);
+
+	if (primary_shard >= 0)
+	{
+		/*
+		 * Launch primary consumer
+		 */
+		appendStringInfo(&group_id_buf, "%s.%d", TextDatumGetCString(group_id), primary_shard);
+
+		/* group_id */
+		fcinfo->arg[2] = CStringGetTextDatum(group_id_buf.data);
+
+		/* shard_id */
+		fcinfo->arg[12] = Int32GetDatum(primary_shard);
+
+		/* num_shards */
+		fcinfo->arg[13] = Int32GetDatum(num_shards);
+
+		fcinfo->argnull[2] = false;
+		fcinfo->argnull[12] = false;
+		fcinfo->argnull[13] = false;
+
+		kafka_consume_begin(fcinfo);
+		CommitTransactionCommand();
+		StartTransactionCommand();
+	}
+	else
+	{
+		elog(WARNING, "no primary shard could be determined");
+	}
+
+	/*
+	 * Now launch redundant consumers with a hint to not aggressively acquire
+	 * consumer lock, since we want to spread active consumers across as many
+	 * nodes as possible
+	 */
+	for (i = 0; i < num_shards; i++)
+	{
+
+	}
+
+	zk_close();
 	PG_RETURN_NULL();
 }
