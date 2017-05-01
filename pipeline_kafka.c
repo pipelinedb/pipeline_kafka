@@ -1740,6 +1740,19 @@ kafka_consume_begin(PG_FUNCTION_ARGS)
 	else
 		delimiter = PG_GETARG_TEXT_P(4);
 
+	if (pg_strcasecmp(TextDatumGetCString(format), FORMAT_JSON) == 0)
+	{
+		pfree(format);
+		format = (text *) CStringGetTextDatum(FORMAT_CSV);
+		if (delimiter != NULL)
+			elog(WARNING, "delimiter cannot be specified with format \"json\", ignoring");
+		delimiter = (text *)  CStringGetTextDatum(FORMAT_JSON_DELIMITER);
+		if (quote != NULL)
+			elog(WARNING, "quote cannot be specified with format \"json\", ignoring");
+		quote = (text *) CStringGetTextDatum(FORMAT_JSON_QUOTE);
+
+	}
+
 	if (PG_ARGISNULL(5))
 		quote = NULL;
 	else
