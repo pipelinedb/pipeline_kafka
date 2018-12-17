@@ -197,12 +197,12 @@ def test_consume_text(pipeline, kafka, clean_db):
     rows = pipeline.execute('SELECT * from comma_cv ORDER BY x')
     assert len(rows) == 100
     for i, row in enumerate(rows):
-      assert row == (i, i, i)
+      assert tuple([row[0], row[1], row[2]]) == (i, i, i)
 
     rows = pipeline.execute('SELECT * from tab_cv ORDER BY x')
     assert len(rows) == 100
     for i, row in enumerate(rows):
-      assert row == (i, i, i)
+      assert tuple([row[0], row[1], row[2]]) == (i, i, i)
 
   assert eventually(delimited_messages)
 
@@ -243,7 +243,7 @@ def test_consume_json(pipeline, kafka, clean_db):
 
     rows = pipeline.execute('SELECT * FROM unpack_cv ORDER BY k')
     for row in rows:
-      k, arr_el = row
+      k, arr_el = row[0], row[1]
       assert k.replace('v', '') == arr_el
 
   assert eventually(unpack_cv)

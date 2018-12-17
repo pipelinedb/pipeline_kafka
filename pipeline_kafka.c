@@ -715,30 +715,6 @@ load_consumer_state(int32 consumer_id, KafkaConsumer *consumer)
 }
 
 /*
- * copy_next
- */
-static int
-copy_next(void *args, void *buf, int minread, int maxread)
-{
-	StringInfo messages = (StringInfo) args;
-	int remaining = messages->len - messages->cursor;
-	int read = 0;
-
-	if (maxread <= remaining)
-		read = maxread;
-	else
-		read = remaining;
-
-	if (read == 0)
-		return 0;
-
-	memcpy(buf, messages->data + messages->cursor, read);
-	messages->cursor += read;
-
-	return read;
-}
-
-/*
  * save_consumer_offsets
  */
 static void
@@ -1482,7 +1458,7 @@ kafka_consume_main(Datum arg)
 
 		if (rd_kafka_consume_start(consumer.topic, partition, start_offset) == -1)
 			elog(ERROR, CONSUMER_LOG_PREFIX "failed to start consuming: %s",
-					CONSUMER_LOG_PREFIX_PARAMS(&consumer), rd_kafka_err2str(rd_kafka_errno2err(errno)));
+					CONSUMER_LOG_PREFIX_PARAMS(&consumer), rd_kafka_err2str(rd_kafka_last_error()));
 
 		my_partitions++;
 	}
@@ -2197,7 +2173,7 @@ kafka_produce_msg(PG_FUNCTION_ARGS)
 
 	if (rd_kafka_produce(topic, partition, RD_KAFKA_MSG_F_COPY, VARDATA_ANY(msg), VARSIZE_ANY_EXHDR(msg),
 			key, keylen, NULL) == -1)
-		elog(ERROR, "failed to produce message (size %ld): %s", VARSIZE_ANY_EXHDR(msg), rd_kafka_err2str(rd_kafka_errno2err(errno)));
+		elog(ERROR, "failed to produce message (size %ld): %s", VARSIZE_ANY_EXHDR(msg), rd_kafka_err2str(rd_kafka_last_error()));
 
 	rd_kafka_poll(MyKafka, 0);
 

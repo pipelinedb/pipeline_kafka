@@ -4,3 +4,4 @@ default_version = '0.9.3'
 module_pathname = '$libdir/pipeline_kafka'
 relocatable = false
 schema = pipeline_kafka
+requires = 'pipelinedb'
