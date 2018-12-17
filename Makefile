@@ -8,6 +8,8 @@ REGRESS = pipeline_kafka
 
 LIB_RDKAFKA_STATIC ?= /usr/lib/librdkafka.a
 
+PG_CPPFLAGS += -I$(shell $(PG_CONFIG) --includedir) -I$(shell $(PG_CONFIG) --includedir-server)/../pipelinedb
+
 SHLIB_LINK += $(LIB_RDKAFKA_STATIC)
 SHLIB_LINK += -lz -lpthread -lssl
 

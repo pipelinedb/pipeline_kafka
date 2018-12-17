@@ -10,7 +10,9 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <execinfo.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "postgres.h"
 
@@ -23,7 +25,11 @@
 #include "access/xlog.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
-#include "catalog/pipeline_stream_fn.h"
+
+#include "pipeline_stream.h"
+//#include "stream.h"#
+#include "config.h"
+
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "commands/copy.h"
@@ -37,7 +43,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/print.h"
 #include "pipeline_kafka.h"
-#include "pipeline/stream.h"
+
 #include "port/atomics.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
@@ -53,6 +59,7 @@
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/snapmgr.h"
+#include "utils/varlena.h"
 
 PG_MODULE_MAGIC;
 
@@ -249,6 +256,35 @@ static HTAB *consumer_groups = NULL;
 
 /* Shared-memory hashtable storing all individual consumer process information */
 static HTAB *consumer_procs = NULL;
+
+static void
+debug_segfault(SIGNAL_ARGS)
+{
+	void *array[32];
+	size_t size = backtrace(array, 32);
+	fprintf(stderr, "Segmentation fault (PID %d)\n", MyProcPid);
+
+	// use pipeline kafka version/revision here!
+	fprintf(stderr, "PostgreSQL version: %s\n", PG_VERSION);
+	fprintf(stderr, "PipelineDB version: %s at revision %s\n", pipeline_version_str, pipeline_revision_str);
+	fprintf(stderr, "backtrace:\n");
+	backtrace_symbols_fd(array, size, STDERR_FILENO);
+
+#ifdef SLEEP_ON_ASSERT
+
+	/*
+	 * It would be nice to use pg_usleep() here, but only does 2000 sec or 33
+	 * minutes, which seems too short.
+	 */
+	sleep(1000000);
+#endif
+
+#ifdef DUMP_CORE
+	abort();
+#else
+	exit(1);
+#endif
+}
 
 static void
 pipeline_kafka_shmem_startup(void)
@@ -842,8 +878,8 @@ get_copy_statement(KafkaConsumer *consumer, bool missing_ok)
 		 * Users can't supply values for arrival_timestamp, so make
 		 * sure we exclude it from the copy attr list
 		 */
-		char *name = pstrdup(NameStr(desc->attrs[i]->attname));
-		if (IsStream(RelationGetRelid(rel)) && pg_strcasecmp(name, ARRIVAL_TIMESTAMP) == 0)
+		char *name = pstrdup(NameStr(TupleDescAttr(desc, i)->attname));
+		if (RelidIsStream(RelationGetRelid(rel)) && pg_strcasecmp(name, ARRIVAL_TIMESTAMP) == 0)
 			continue;
 		stmt->attlist = lappend(stmt->attlist, makeString(name));
 	}
@@ -899,8 +935,8 @@ execute_copy(KafkaConsumer *consumer, KafkaConsumerProc *proc, CopyStmt *stmt, S
 	PG_TRY();
 	{
 		uint64 processed;
-		copy_iter_arg = buf;
-		DoCopy(stmt, "COPY", &processed);
+//		copy_iter_arg = buf;
+//		DoCopy(stmt, "COPY", &processed);
 	}
 	PG_CATCH();
 	{
@@ -1303,7 +1339,7 @@ kafka_consume_main(Datum arg)
 	BackgroundWorkerUnblockSignals();
 
 	/* give this proc access to the database */
-	BackgroundWorkerInitializeConnectionByOid(proc->db, InvalidOid);
+	BackgroundWorkerInitializeConnectionByOid(proc->db, InvalidOid, 0);
 
 	/* set up error buffer */
 	error_buf_init(&my_error_buf, ERROR_BUF_SIZE);
@@ -1426,7 +1462,7 @@ kafka_consume_main(Datum arg)
 	}
 
 	/* set copy hook */
-	copy_iter_hook = copy_next;
+//	copy_iter_hook = copy_next;
 
 	work_ctx = AllocSetContextCreate(TopMemoryContext, "KafkaConsumerContext",
 				ALLOCSET_DEFAULT_MINSIZE,
@@ -1549,7 +1585,7 @@ create_or_update_consumer(ResultRelInfo *consumers, text *relation, text *topic,
 		values[CONSUMER_ATTR_TOPIC - 1] = PointerGetDatum(topic);
 
 		seqrel = heap_openrv(get_rangevar("consumers_id_seq"), AccessShareLock);
-		consumer_id = nextval_internal(RelationGetRelid(seqrel));
+		consumer_id = nextval_internal(RelationGetRelid(seqrel), true);
 		heap_close(seqrel, NoLock);
 		values[CONSUMER_ATTR_ID -1] = Int32GetDatum(consumer_id);
 
