@@ -7,7 +7,7 @@ services:
     ports:
       - "2181:2181"
   kafka0:
-    image: wurstmeister/kafka:0.8.2.2
+    image: wurstmeister/kafka:2.12-2.1.0
     container_name: pipeline_kafka_broker0
     network_mode: host
     environment:
